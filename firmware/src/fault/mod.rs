@@ -1,162 +1,31 @@
-pub mod spi;
-pub mod i2c;
-pub mod uart;
-pub mod can;
-pub mod onewire;
+//! Fault-injection command task. The injector logic itself lives in the
+//! host-testable `shared::fault` module; this module adds the bit-banged UART
+//! command interface and drives the five protocol injectors.
 
 use defmt::info;
-use shared::{FaultConfig, FaultType, FaultCommand, FaultResult, Protocol, FaultInjector};
-
-// ─── Bit manipulation primitives ──────────────────────────────────────────────
-
-#[inline(always)]
-pub fn bit_flip(byte: u8, bit: u8) -> u8 {
-    byte ^ (1 << (bit & 7))
-}
-
-#[inline(always)]
-pub fn bit_set(byte: u8, bit: u8) -> u8 {
-    byte | (1 << (bit & 7))
-}
-
-#[inline(always)]
-pub fn bit_clear(byte: u8, bit: u8) -> u8 {
-    byte & !(1 << (bit & 7))
-}
-
-#[inline(always)]
-pub fn busy_delay_us(us: u32) {
-    let cycles = us.wrapping_mul(21);
-    for _ in 0..cycles {
-        cortex_m::asm::nop();
-    }
-}
-
-// ─── LFSR for probabilistic injection ────────────────────────────────────────
-
-pub struct Lfsr {
-    state: u16,
-}
-
-impl Lfsr {
-    pub const fn new(seed: u16) -> Self {
-        Self { state: if seed == 0 { 1 } else { seed } }
-    }
-
-    pub fn next(&mut self) -> u16 {
-        let bit = ((self.state >> 0) ^ (self.state >> 2) ^ (self.state >> 3) ^ (self.state >> 5)) & 1;
-        self.state = (self.state >> 1) | (bit << 15);
-        self.state
-    }
-
-    pub fn next_bit(&mut self) -> u8 {
-        (self.next() & 0x07) as u8
-    }
-}
-
-#[inline(always)]
-pub fn should_inject(lfsr: &mut Lfsr, permille: u16) -> bool {
-    if permille == 0 {
-        return false;
-    }
-    if permille >= 1000 {
-        return true;
-    }
-    let r = lfsr.next() & 0x03FF;
-    (r as u16) < permille
-}
-
-// ─── Fault Engine (pure state, no hardware) ───────────────────────────────────
-
-pub struct FaultEngine {
-    config: FaultConfig,
-    armed: bool,
-    fired: bool,
-    fire_count: u32,
-}
-
-impl FaultEngine {
-    pub fn new() -> Self {
-        Self {
-            config: FaultConfig::new(Protocol::Spi, FaultType::BitFlip),
-            armed: false,
-            fired: false,
-            fire_count: 0,
-        }
-    }
-
-    pub fn with_config(mut self, config: FaultConfig) -> Self {
-        self.config = config;
-        self
-    }
-
-    pub fn handle_command(&mut self, cmd: FaultCommand) -> FaultResult {
-        match cmd {
-            FaultCommand::Arm => {
-                self.armed = true;
-                self.fired = false;
-                self.fire_count = 0;
-                FaultResult::Armed
-            }
-            FaultCommand::Disarm => {
-                self.armed = false;
-                FaultResult::Disarmed
-            }
-            FaultCommand::Fire => {
-                if !self.armed {
-                    return FaultResult::Error;
-                }
-                self.fired = true;
-                self.fire_count += 1;
-                FaultResult::Fired
-            }
-            FaultCommand::Status => {
-                if self.fired { FaultResult::Completed }
-                else if self.armed { FaultResult::Armed }
-                else { FaultResult::Disarmed }
-            }
-            FaultCommand::Reset => {
-                self.armed = false;
-                self.fired = false;
-                self.fire_count = 0;
-                FaultResult::Disarmed
-            }
-        }
-    }
-
-    pub fn is_armed(&self) -> bool { self.armed }
-    pub fn should_inject(&self) -> bool { self.armed && self.fired }
-    pub fn config(&self) -> &FaultConfig { &self.config }
-    pub fn fire_count(&self) -> u32 { self.fire_count }
-    pub fn reset_stats(&mut self) { self.fire_count = 0; }
-}
+use embassy_stm32::gpio::{Input, Level, Output, Pull, Speed};
+use embassy_stm32::peripherals::{PB6, PB7};
+use embassy_stm32::Peri;
+use shared::fault::{
+    busy_delay_us, CanBus, CanFaultInjector, I2cBus, I2cFaultInjector, OneWireBus,
+    OneWireFaultInjector, SpiBus, SpiFaultInjector, UartBus, UartFaultInjector,
+};
+use shared::{FaultCommand, FaultConfig, FaultResult, FaultType, Protocol};
 
 // ─── Bit-banged UART command interface (8N1, 115200) ──────────────────────────
 
-#[cfg(feature = "fault")]
-use embassy_stm32::gpio::{Level, Output, Speed, Input, Pull};
-#[cfg(feature = "fault")]
-use embassy_stm32::Peri;
-#[cfg(feature = "fault")]
-use embassy_stm32::peripherals::{PB6, PB7};
-
 pub struct UartBitbang<'d> {
-    #[cfg(feature = "fault")]
     tx: Output<'d>,
-    #[cfg(feature = "fault")]
     input: Input<'d>,
     baud_period_us: u32,
-    _phantom: core::marker::PhantomData<&'d ()>,
 }
 
-#[cfg(feature = "fault")]
 impl<'d> UartBitbang<'d> {
     pub fn new(tx_pin: Peri<'d, PB6>, rx_pin: Peri<'d, PB7>) -> Self {
         Self {
             tx: Output::new(tx_pin, Level::High, Speed::High),
             input: Input::new(rx_pin, Pull::Up),
             baud_period_us: 8,
-            _phantom: core::marker::PhantomData,
         }
     }
 
@@ -202,15 +71,43 @@ impl<'d> UartBitbang<'d> {
     }
 }
 
-/// Embassy task entry point for fault injection command loop.
-#[cfg(feature = "fault")]
-#[embassy_executor::task]
-pub async fn fault_task_entry(uart: UartBitbang<'static>, engine: FaultEngine) {
-    info!("fault: task entry started");
-    let mut uart = uart;
-    let mut engine = engine;
-    let mut buf = [0u8; 1];
+// ─── Command loop: drive all five protocol injectors ──────────────────────────
+// Commands arrive on the bit-banged UART (PB6 TX / PB7 RX, 115200 8N1):
+//   0x01 Arm   — arm all injectors
+//   0x02 Disarm — disarm all injectors
+//   0x03 Fire  — inject into one simulated frame per protocol, report result
+//   0x04 Status — Armed or Disarmed
+//   0x05 Reset  — disarm and clear injection counters
+// Each reply is a single byte (FaultResult). Injected frames are printed via RTT.
 
+#[embassy_executor::task]
+pub async fn fault_task_entry(uart: UartBitbang<'static>) -> ! {
+    info!("fault: task started — SPI/I2C/UART/CAN/OneWire injectors ready");
+    let mut uart = uart;
+
+    let mut can = CanFaultInjector::new();
+    let mut spi = SpiFaultInjector::new();
+    let mut i2c = I2cFaultInjector::new();
+    let mut uart_inj = UartFaultInjector::new();
+    let mut onewire = OneWireFaultInjector::new();
+
+    can.configure(&FaultConfig::new(Protocol::Can, FaultType::CrcCorrupt));
+    spi.configure(&FaultConfig::new(Protocol::Spi, FaultType::BitDelay).at_bit(0).for_us(20));
+    i2c.configure(&FaultConfig::new(Protocol::I2c, FaultType::StuckAtOne).at_bit(0));
+    uart_inj.configure(&FaultConfig::new(Protocol::Uart, FaultType::ParityError).at_bit(0));
+    onewire.configure(&FaultConfig::new(Protocol::OneWire, FaultType::CrcCorrupt));
+
+    let mut can_bus = CanBus {
+        id: 0x123,
+        data: [0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04],
+        dlc: 8,
+    };
+    let mut spi_bus = SpiBus { sck: true, mosi: 0xA5, miso: 0x5A, cs: true };
+    let mut i2c_bus = I2cBus { sda: true, scl: true, address: 0x50, data: 0xAA };
+    let mut uart_bus = UartBus { tx: 0xAA, rx: 0x55 };
+    let mut ow_bus = OneWireBus { line: true, rom_cmd: 0xCC, scratchpad: [0xFF; 9] };
+
+    let mut buf = [0u8; 1];
     loop {
         let _ = uart.read(&mut buf).await;
         let cmd = match buf[0] {
@@ -221,129 +118,73 @@ pub async fn fault_task_entry(uart: UartBitbang<'static>, engine: FaultEngine) {
             0x05 => FaultCommand::Reset,
             _ => continue,
         };
-        let result = engine.handle_command(cmd);
+
+        let result = match cmd {
+            FaultCommand::Arm => {
+                can.arm();
+                spi.arm();
+                i2c.arm();
+                uart_inj.arm();
+                onewire.arm();
+                FaultResult::Armed
+            }
+            FaultCommand::Disarm => {
+                can.disarm();
+                spi.disarm();
+                i2c.disarm();
+                uart_inj.disarm();
+                onewire.disarm();
+                FaultResult::Disarmed
+            }
+            FaultCommand::Fire => {
+                let results = [
+                    can.fire(&mut can_bus),
+                    spi.fire(&mut spi_bus),
+                    i2c.fire(&mut i2c_bus),
+                    uart_inj.fire(&mut uart_bus),
+                    onewire.fire(&mut ow_bus),
+                ];
+                if results.iter().any(|r| *r == FaultResult::Fired) {
+                    info!(
+                        "fault: fired — can id=0x{:03X} dlc={} | spi sck={} cs={} mosi=0x{:02X} miso=0x{:02X} | i2c sda={} scl={} addr=0x{:02X} data=0x{:02X} | uart tx=0x{:02X} | ow line={} rom=0x{:02X}",
+                        can_bus.id, can_bus.dlc, spi_bus.sck, spi_bus.cs, spi_bus.mosi, spi_bus.miso,
+                        i2c_bus.sda, i2c_bus.scl, i2c_bus.address, i2c_bus.data,
+                        uart_bus.tx, ow_bus.line, ow_bus.rom_cmd
+                    );
+                    info!(
+                        "fault: counts — can={} spi={} i2c={} uart={} ow={}",
+                        can.injected_count(), spi.injected_count(), i2c.injected_count(),
+                        uart_inj.injected_count(), onewire.injected_count()
+                    );
+                    FaultResult::Fired
+                } else {
+                    FaultResult::Error
+                }
+            }
+            FaultCommand::Status => {
+                let any_armed = can.is_armed()
+                    || spi.is_armed()
+                    || i2c.is_armed()
+                    || uart_inj.is_armed()
+                    || onewire.is_armed();
+                if any_armed { FaultResult::Armed } else { FaultResult::Disarmed }
+            }
+            FaultCommand::Reset => {
+                can.disarm();
+                spi.disarm();
+                i2c.disarm();
+                uart_inj.disarm();
+                onewire.disarm();
+                can.reset_stats();
+                spi.reset_stats();
+                i2c.reset_stats();
+                uart_inj.reset_stats();
+                onewire.reset_stats();
+                FaultResult::Disarmed
+            }
+        };
+
         let _ = uart.write(&[result as u8]).await;
         info!("fault: cmd={} result={}", buf[0], result as u8);
-    }
-}
-
-// ─── Tests (no hardware dependency) ──────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn bit_flip_toggles() {
-        assert_eq!(bit_flip(0b1010_0000, 0), 0b1010_0001);
-        assert_eq!(bit_flip(0b1010_0001, 0), 0b1010_0000);
-        assert_eq!(bit_flip(0b0000_0000, 7), 0b1000_0000);
-    }
-
-    #[test]
-    fn bit_set_forces_high() {
-        assert_eq!(bit_set(0b0000_0000, 3), 0b0000_1000);
-        assert_eq!(bit_set(0b0000_1000, 3), 0b0000_1000);
-    }
-
-    #[test]
-    fn bit_clear_forces_low() {
-        assert_eq!(bit_clear(0b1111_1111, 4), 0b1110_1111);
-        assert_eq!(bit_clear(0b0000_0000, 4), 0b0000_0000);
-    }
-
-    #[test]
-    fn bit_wraps_on_overflow() {
-        assert_eq!(bit_flip(0xFF, 8), 0xFE);
-        assert_eq!(bit_flip(0xFF, 16), 0xFE);
-    }
-
-    #[test]
-    fn lfsr_produces_values() {
-        let mut lfsr = Lfsr::new(0xACE1);
-        let v1 = lfsr.next();
-        let v2 = lfsr.next();
-        assert_ne!(v1, 0);
-        assert_ne!(v2, 0);
-        assert_ne!(v1, v2);
-    }
-
-    #[test]
-    fn lfsr_next_bit_range() {
-        let mut lfsr = Lfsr::new(42);
-        for _ in 0..100 {
-            assert!(lfsr.next_bit() < 8);
-        }
-    }
-
-    #[test]
-    fn should_inject_full_permille() {
-        let mut lfsr = Lfsr::new(1);
-        for _ in 0..1000 {
-            assert!(should_inject(&mut lfsr, 1000));
-        }
-    }
-
-    #[test]
-    fn should_inject_zero_permille() {
-        let mut lfsr = Lfsr::new(1);
-        for _ in 0..1000 {
-            assert!(!should_inject(&mut lfsr, 0));
-        }
-    }
-
-    #[test]
-    fn engine_arm_disarm() {
-        let mut engine = FaultEngine::new();
-        assert!(!engine.is_armed());
-        assert_eq!(engine.handle_command(FaultCommand::Arm), FaultResult::Armed);
-        assert!(engine.is_armed());
-        assert_eq!(engine.handle_command(FaultCommand::Disarm), FaultResult::Disarmed);
-        assert!(!engine.is_armed());
-    }
-
-    #[test]
-    fn engine_fire_when_armed() {
-        let mut engine = FaultEngine::new()
-            .with_config(FaultConfig::new(Protocol::I2c, FaultType::NackInjection));
-        engine.handle_command(FaultCommand::Arm);
-        assert_eq!(engine.handle_command(FaultCommand::Fire), FaultResult::Fired);
-        assert!(engine.should_inject());
-        assert_eq!(engine.fire_count(), 1);
-    }
-
-    #[test]
-    fn engine_fire_when_disarmed() {
-        let mut engine = FaultEngine::new();
-        assert_eq!(engine.handle_command(FaultCommand::Fire), FaultResult::Error);
-    }
-
-    #[test]
-    fn engine_status() {
-        let mut engine = FaultEngine::new();
-        assert_eq!(engine.handle_command(FaultCommand::Status), FaultResult::Disarmed);
-        engine.handle_command(FaultCommand::Arm);
-        assert_eq!(engine.handle_command(FaultCommand::Status), FaultResult::Armed);
-        engine.handle_command(FaultCommand::Fire);
-        assert_eq!(engine.handle_command(FaultCommand::Status), FaultResult::Completed);
-    }
-
-    #[test]
-    fn engine_reset() {
-        let mut engine = FaultEngine::new();
-        engine.handle_command(FaultCommand::Arm);
-        engine.handle_command(FaultCommand::Fire);
-        assert_eq!(engine.handle_command(FaultCommand::Reset), FaultResult::Disarmed);
-        assert!(!engine.is_armed());
-        assert!(!engine.should_inject());
-        assert_eq!(engine.fire_count(), 0);
-    }
-
-    #[test]
-    fn engine_config_override() {
-        let engine = FaultEngine::new()
-            .with_config(FaultConfig::new(Protocol::Can, FaultType::BitFlip).at_bit(5));
-        assert_eq!(engine.config().protocol, Protocol::Can);
-        assert_eq!(engine.config().target_bit, 5);
     }
 }

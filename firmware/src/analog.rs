@@ -5,7 +5,7 @@ use embassy_stm32::{
     Peri,
 };
 
-use shared::{SamplePacket, AdcCalibration, ChannelId};
+use shared::{SamplePacket, ChannelId};
 
 use crate::transport::Transport;
 
@@ -57,6 +57,7 @@ impl AnalogSampler {
 }
 
 #[embassy_executor::task]
+#[allow(static_mut_refs)]
 pub async fn adc_task(
     adc: Peri<'static, peripherals::ADC1>,
     dma: Peri<'static, peripherals::DMA2_CH0>,
@@ -85,7 +86,6 @@ pub async fn adc_task(
     let mut measurements = [0u16; 2048];
     let mut packet = SamplePacket::new();
     let mut seq = 0u16;
-    let calibration = AdcCalibration::default();
     let mut last_timestamp: u32 = 0;
     
     loop {
@@ -132,13 +132,5 @@ pub async fn adc_task(
 
 fn isnan(value: u32) -> bool {
     value == 0 || value > 65535
-}
-
-fn get_timestamp() -> u32 {
-    static mut timestamp_counter: u32 = 0;
-    unsafe {
-        timestamp_counter = timestamp_counter.wrapping_add(100);
-        timestamp_counter
-    }
 }
 

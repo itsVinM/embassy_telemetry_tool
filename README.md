@@ -15,22 +15,26 @@ For the full DAQ platform (analog capture, DAC output, trigger system, calibrati
 | Fault | `fault` | SPI, I2C, UART, CAN, OneWire fault injection |
 | Analog | `analog` (default) | ADC1 DMA ring buffer — dual-channel interleaved, 10 kHz |
 | Digital | `digital` | TIM1 PWM output (4ch), TIM3 input capture |
-| Transport | always | USART2 binary packet stream (115200 baud) |
+| Transport | `analog` | USART2 binary packet stream (115200 baud) |
 
 ## Architecture
 
 ```
-firmware/src/main.rs           — entry, peripheral init
-firmware/src/fault/mod.rs      — FaultEngine, UartBitbang
-firmware/src/fault/spi.rs      — SPI injector
-firmware/src/fault/i2c.rs      — I2C injector
-firmware/src/fault/uart.rs     — UART injector
-firmware/src/fault/can.rs      — CAN injector (MCP2515)
-firmware/src/fault/onewire.rs  — OneWire injector
-shared/src/lib.rs              — FaultInjector<'d, B> trait, tests
+firmware/src/main.rs        — entry, MPU init, clock tree, health checks
+firmware/src/fault/mod.rs   — fault task + bit-banged UART command interface
+firmware/src/analog.rs      — ADC1/DMA2 ring buffer → SamplePacket → Transport
+firmware/src/digital.rs     — TIM1 PWM (4ch) + TIM3 input capture
+firmware/src/transport.rs   — USART2 + DMA packet transport
+firmware/src/health.rs      — clock, stack-canary, and RAM self-tests
+firmware/src/mpu.rs         — MPU regions (flash RO, SRAM RW+XN, stack guard)
+shared/src/lib.rs           — DAQ/fault data types, wire protocol
+shared/src/fault.rs         — concrete injectors (SPI/I2C/UART/CAN/OneWire), unit-tested
 ```
 
-Key pattern: `FaultInjector<'d, B>` — generic over bus type `B`, lifetime `'d`. Same trait in both this project and the [rp2040-fault-inject](https://github.com/itsVinM/rp2040_embedded_faut_injection) project.
+Key pattern: each protocol has one concrete injector struct (`configure`/`arm`/
+`disarm`/`fire`/`is_armed`/`injected_count`/`reset_stats`) plus a simulated bus.
+The injectors are pure logic in `shared`, so they are unit-tested on the host;
+the firmware task drives all five over a bit-banged UART (PB6/PB7).
 
 ## Pin map
 
@@ -48,7 +52,7 @@ PB7  Fault UART RX
 ```bash
 cargo build --release                                          # analog (default)
 cargo build --release --no-default-features --features digital # digital
-cargo build --release --features fault                         # + fault injection
+cargo build --release --no-default-features --features fault   # fault injection
 ```
 
 ## Flash
@@ -59,12 +63,8 @@ probe-rs run --chip STM32F401RETx target/thumbv7em-none-eabihf/release/firmware
 
 ## Tests
 
+The fault-injection library and shared data types are pure logic and run on the host:
+
 ```bash
 cd shared && cargo test
-```
-
-## Docker
-
-```bash
-docker compose up --build
 ```

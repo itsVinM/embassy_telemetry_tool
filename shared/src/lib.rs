@@ -2,6 +2,8 @@
 
 use core::mem::MaybeUninit;
 
+pub mod fault;
+
 // ─── DMA Buffer ───────────────────────────────────────────────────────────────
 
 #[repr(C, align(4))]
@@ -21,12 +23,27 @@ impl<T, const N: usize> DmaBuf<T, N> {
         N
     }
 
+    pub const fn is_empty(&self) -> bool {
+        N == 0
+    }
+
     pub fn as_mut_ptr(&mut self) -> *mut T {
         self.buf.as_mut_ptr() as *mut T
     }
 
+    /// Exposes the backing storage as a mutable slice for DMA.
+    ///
+    /// # Safety
+    ///
+    /// Must not be aliased while a DMA transfer is writing to the buffer.
     pub unsafe fn as_mut_slice(&mut self) -> &mut [T] {
         core::slice::from_raw_parts_mut(self.buf.as_mut_ptr() as *mut T, N)
+    }
+}
+
+impl<T: Copy, const N: usize> Default for DmaBuf<T, N> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -96,6 +113,12 @@ impl SamplePacket {
     pub fn as_bytes(&self) -> &[u8] {
         let len = core::mem::size_of_val(self);
         unsafe { core::slice::from_raw_parts(self as *const _ as *const u8, len) }
+    }
+}
+
+impl Default for SamplePacket {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -174,32 +197,20 @@ pub enum HealthStatus {
 pub enum HealthError {
     StackCanary,
     RamTest,
-    FlashCRC,
     TimerNotTicking,
     ClockOutOfRange,
     ClockHclkNotRunning,
-    AdcCalibration,
-    I2cInitFailed,
-    SpiInitFailed,
-    UartInitFailed,
-    DmaInitFailed,
 }
 
 impl HealthStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
-            HealthStatus::Ready                                     => "READY\n",
-            HealthStatus::Fail(HealthError::AdcCalibration)        => "FAIL:adc\n",
-            HealthStatus::Fail(HealthError::TimerNotTicking)        => "FAIL:tim\n",
-            HealthStatus::Fail(HealthError::ClockOutOfRange)        => "FAIL:clk\n",
-            HealthStatus::Fail(HealthError::ClockHclkNotRunning)   => "FAIL:hclk\n",
-            HealthStatus::Fail(HealthError::StackCanary)            => "FAIL:stack\n",
-            HealthStatus::Fail(HealthError::RamTest)                => "FAIL:ram\n",
-            HealthStatus::Fail(HealthError::FlashCRC)               => "FAIL:flash\n",
-            HealthStatus::Fail(HealthError::I2cInitFailed)          => "FAIL:i2c\n",
-            HealthStatus::Fail(HealthError::SpiInitFailed)          => "FAIL:spi\n",
-            HealthStatus::Fail(HealthError::UartInitFailed)         => "FAIL:uart\n",
-            HealthStatus::Fail(HealthError::DmaInitFailed)          => "FAIL:dma\n",
+            HealthStatus::Ready => "READY\n",
+            HealthStatus::Fail(HealthError::StackCanary) => "FAIL:stack\n",
+            HealthStatus::Fail(HealthError::RamTest) => "FAIL:ram\n",
+            HealthStatus::Fail(HealthError::TimerNotTicking) => "FAIL:tim\n",
+            HealthStatus::Fail(HealthError::ClockOutOfRange) => "FAIL:clk\n",
+            HealthStatus::Fail(HealthError::ClockHclkNotRunning) => "FAIL:hclk\n",
         }
     }
 }
@@ -298,20 +309,6 @@ impl FaultConfig {
     }
 }
 
-/// Core trait for all protocol fault injectors.
-/// Generic over the protocol bus type `B` — each protocol provides its own bus handle.
-pub trait FaultInjector<'d, B: ?Sized> {
-    type Error;
-
-    fn configure(&mut self, config: &FaultConfig) -> Result<(), Self::Error>;
-    fn arm(&mut self) -> Result<(), Self::Error>;
-    fn disarm(&mut self) -> Result<(), Self::Error>;
-    fn fire(&mut self, bus: &mut B) -> Result<FaultResult, Self::Error>;
-    fn is_armed(&self) -> bool;
-    fn injected_count(&self) -> u32;
-    fn reset_stats(&mut self);
-}
-
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -321,12 +318,6 @@ mod tests {
     #[test]
     fn ready_status_returns_correct_string() {
         assert_eq!(HealthStatus::Ready.as_str(), "READY\n");
-    }
-
-    #[test]
-    fn fail_adc_returns_correct_string() {
-        let status = HealthStatus::Fail(HealthError::AdcCalibration);
-        assert_eq!(status.as_str(), "FAIL:adc\n");
     }
 
     #[test]
@@ -447,87 +438,5 @@ mod tests {
     fn fault_result_repr() {
         assert_eq!(FaultResult::Armed as u8, 0x01);
         assert_eq!(FaultResult::Completed as u8, 0x06);
-    }
-
-    // ── Mock FaultInjector test ──────────────────────────────────────────
-
-    struct MockBus;
-
-    struct MockInjector {
-        armed: bool,
-        count: u32,
-    }
-
-    impl MockInjector {
-        fn new() -> Self {
-            Self { armed: false, count: 0 }
-        }
-    }
-
-    impl<'d> FaultInjector<'d, MockBus> for MockInjector {
-        type Error = ();
-
-        fn configure(&mut self, _config: &FaultConfig) -> Result<(), ()> {
-            Ok(())
-        }
-        fn arm(&mut self) -> Result<(), ()> {
-            self.armed = true;
-            Ok(())
-        }
-        fn disarm(&mut self) -> Result<(), ()> {
-            self.armed = false;
-            Ok(())
-        }
-        fn fire(&mut self, _bus: &mut MockBus) -> Result<FaultResult, ()> {
-            if !self.armed {
-                return Err(());
-            }
-            self.count += 1;
-            Ok(FaultResult::Fired)
-        }
-        fn is_armed(&self) -> bool {
-            self.armed
-        }
-        fn injected_count(&self) -> u32 {
-            self.count
-        }
-        fn reset_stats(&mut self) {
-            self.count = 0;
-        }
-    }
-
-    #[test]
-    fn trait_arm_fire_cycle() {
-        let mut inj = MockInjector::new();
-        let mut bus = MockBus;
-
-        assert!(!inj.is_armed());
-        inj.arm().unwrap();
-        assert!(inj.is_armed());
-
-        let r = inj.fire(&mut bus).unwrap();
-        assert_eq!(r, FaultResult::Fired);
-        assert_eq!(inj.injected_count(), 1);
-
-        inj.disarm().unwrap();
-        assert!(!inj.is_armed());
-        assert!(inj.fire(&mut bus).is_err());
-    }
-
-    #[test]
-    fn trait_generic_dispatch() {
-        use core::fmt::Debug;
-        fn dispatch<I: FaultInjector<'static, MockBus>>(inj: &mut I, bus: &mut MockBus)
-        where
-            I::Error: Debug,
-        {
-            inj.arm().unwrap();
-            inj.fire(bus).unwrap();
-        }
-
-        let mut inj = MockInjector::new();
-        let mut bus = MockBus;
-        dispatch(&mut inj, &mut bus);
-        assert_eq!(inj.injected_count(), 1);
     }
 }

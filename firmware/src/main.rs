@@ -15,9 +15,12 @@ use shared::HealthStatus;
 
 mod health;
 mod mpu;
+#[cfg(feature = "analog")]
 mod analog;
-mod digital;
+#[cfg(feature = "analog")]
 mod transport;
+#[cfg(feature = "digital")]
+mod digital;
 #[cfg(feature = "fault")]
 mod fault;
 
@@ -101,13 +104,12 @@ async fn main(spawner: Spawner) {
     {
         info!("=== FAULT INJECTION MODE ===");
         let uart = fault::UartBitbang::new(peripherals.PB6, peripherals.PB7);
-        let engine = fault::FaultEngine::new();
-        spawner.spawn(fault::fault_task_entry(uart, engine).unwrap());
+        spawner.spawn(fault::fault_task_entry(uart).unwrap());
     }
 
-    #[cfg(not(any(feature = "analog", feature = "digital")))]
+    #[cfg(not(any(feature = "analog", feature = "digital", feature = "fault")))]
     {
-        info!("WARNING: No features enabled. Enable 'analog' or 'digital' in Cargo.toml");
+        info!("WARNING: No features enabled. Enable 'analog', 'digital', or 'fault' in Cargo.toml");
         loop {}
     }
 }
