@@ -1,12 +1,13 @@
-# STM32 DAQ Platform — Fault Injection Configuration
+# stm32-daq
 
-Mixed-signal DAQ and fault injection platform for STM32F401RE (Nucleo-64). Rust, bare-metal, no heap. This is the **fault injection** configuration of the [STM32 DAQ Platform](../embedded_mixed_signal_analyzer/).
+Mixed-signal DAQ and protocol-level fault injection platform for STM32F401RE (Nucleo-64). Rust, bare-metal, no heap, all no-std.
+
+> **Proposed repo name:** `stm32-daq` (current directory name `embedded_daq_system` is the old one). This is a standalone platform — it is not a configuration of any other repo.
 
 ## What
 
-Protocol-level fault injection on embedded buses. SPI, I2C, UART, CAN, and OneWire fault injection with LFSR-driven probabilistic control, all feature-gated, all no-std.
-
-For the full DAQ platform (analog capture, DAC output, trigger system, calibration, Python CLI), see [`embedded_mixed_signal_analyzer`](../embedded_mixed_signal_analyzer/).
+- **DAQ:** dual-channel interleaved ADC capture at 10 kHz via ADC1/DMA2 ring buffer, TIM1 PWM output (4ch), TIM3 input capture, USART2 binary packet stream.
+- **Fault injection:** SPI, I2C, UART, CAN, and OneWire fault injection with LFSR-driven probabilistic control, feature-gated.
 
 ## Modules
 
