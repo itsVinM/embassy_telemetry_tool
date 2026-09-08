@@ -1,5 +1,5 @@
 [package]
-name = "firmware"
+name = "stm32-security-tool"
 version = "0.1.0"
 edition = "2021"
 
@@ -14,12 +14,35 @@ embassy-stm32 = { git = "https://github.com/embassy-rs/embassy", features = [
     "stm32f401re",
     "time-driver-tim2",
     "exti",
+    "adc",
+    "dma",
+    "rng",
+    "usart",
+    "usb",
     "defmt",
 ]}
 embassy-time = { git = "https://github.com/embassy-rs/embassy", features = [
     "defmt",
     "defmt-timestamp-uptime",
 ]}
+embassy-usb = { git = "https://github.com/embassy-rs/embassy", features = [
+    "cdc-acm",
+    "defmt",
+]}
+
+# Crypto (no_std compatible)
+aes = { version = "0.8", features = ["soft", "zeroize"] }
+chacha20 = { version = "0.9", features = ["zeroize"] }
+sha2 = { version = "0.10", features = ["zeroize"] }
+hmac = { version = "0.12", features = ["zeroize"] }
+rand-core = "0.6"
+getrandom = { version = "0.2", features = ["custom"] }
+subtle = "2.5"
+
+# Serialization for USB protocol
+postcard = { version = "1.0", features = ["alloc"] }
+cobs = "0.2"
+heapless = { version = "0.8", features = ["alloc"] }
 
 defmt = "0.3"
 defmt-rtt = "0.4"
@@ -39,7 +62,24 @@ opt-level = "z"
 debug = 2
 
 [features]
-default = ["analog"]
-analog = []
-digital = []
-fault = []
+default = ["crypto"]
+crypto = ["aes", "chacha", "sha256", "trng"]
+fault = ["voltage-glitch", "clock-glitch", "protocol-injectors"]
+sco = ["adc-capture", "trigger", "alignment", "export"]
+usb = ["usb-cdc", "usb-hid"]
+full = ["crypto", "fault", "sco", "usb"]
+
+# Individual features
+aes = []
+chacha = []
+sha256 = []
+trng = []
+voltage-glitch = []
+clock-glitch = []
+protocol-injectors = []
+adc-capture = []
+trigger = []
+alignment = []
+export = []
+usb-cdc = []
+usb-hid = []
