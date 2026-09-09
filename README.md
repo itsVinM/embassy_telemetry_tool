@@ -1,4 +1,4 @@
-# stm32-selftest
+# embassy-telemetry-tool
 
 BIST + UART telemetry firmware for the STM32F401RE (Nucleo-64). Rust + Embassy, no-std, no heap.
 
@@ -51,5 +51,5 @@ cd shared && cargo test   # 40 host tests: injectors, telemetry structs, protoco
 ## Flash
 
 ```bash
-probe-rs run --chip STM32F401RETx target/thumbv7em-none-eabihf/release/stm32-selftest
+probe-rs run --chip STM32F401RETx target/thumbv7em-none-eabihf/release/embassy-telemetry-tool
 ```

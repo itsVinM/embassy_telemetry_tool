@@ -15,7 +15,7 @@ mod sco;
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    info!("=== stm32-selftest starting ===");
+    info!("=== embassy-telemetry-tool starting ===");
     info!("Target: STM32F401RE (Nucleo-F401RE)");
     info!("Features: MPU + Stack Canary + AES + Fault Injection + SCO");
 
