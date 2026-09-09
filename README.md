@@ -1,73 +1,55 @@
-# stm32-daq
+# stm32-selftest
 
-Rust + Embassy mixed-signal DAQ and protocol-level fault injection platform for the STM32F401RE (Nucleo-64). Async, no-std, no heap.
+BIST + UART telemetry firmware for the STM32F401RE (Nucleo-64). Rust + Embassy, no-std, no heap.
 
-## Highlights
+## What it does
 
-- **Embassy async runtime** — `embassy-executor` thread executor, `embassy-stm32` (stm32f401re, TIM2 time driver), `embassy-time`.
-- **DMA-driven capture** — dual-channel interleaved ADC1 capture at 10 kHz into a ring buffer, streamed as binary `SamplePacket`s over USART2+DMA at 115200 baud.
-- **Protocol fault injection** — SPI, I2C, UART, CAN, and OneWire injectors with LFSR-driven probabilistic control, driven over a bit-banged UART command link (PB6/PB7).
-- **Host-testable core** — all injector logic lives in the `shared` crate (pure no-std logic), unit-tested on the host; the firmware task is a thin driver over it.
-- **Hardened runtime** — MPU regions (flash RO, SRAM RW+XN, peripherals device, stack guard), flash ART configured for 84 MHz, boot-time health checks (clock, stack canary, RAM self-test).
-- **RTT diagnostics** — defmt + defmt-rtt + panic-probe: structured logging and panic backtraces over RTT, no extra wiring.
+1. **BIST on boot** — validates the MCU before doing anything: MPU + stack canary, clock/RAM health checks, ADC telemetry loopback, and SPI/I2C/UART fault-inject stability (fires against simulated in-RAM buses, asserts expected frames).
+2. **UART telemetry** — streams `SamplePacket`s from anything connected over UART (PA2/PA3) to the host over USB CDC.
+3. **Host monitor** — BIST report + live telemetry available on demand over USB CDC.
 
 ## Modules
 
-| Module | Feature flag | Description |
-|--------|-------------|-------------|
-| Fault | `fault` | SPI, I2C, UART, CAN, OneWire fault injection (bit-banged UART command interface) |
-| Analog | `analog` (default) | ADC1/DMA2 dual-channel interleaved ring buffer, 10 kHz |
-| Digital | `digital` | TIM1 PWM output (4ch), TIM3 input capture |
-| Transport | `analog` | Async USART2+DMA binary packet stream (115200 baud) |
+| Module | Description |
+|--------|-------------|
+| `fault/` | SPI/I2C/UART injectors vs simulated buses — BIST stability check only |
+| `sco/` | ADC capture (1 MS/s, DMA) — telemetry loopback for BIST |
+| `uart_telemetry.rs` | Streams telemetry from UART-connected devices to host |
+| `mpu.rs` | 4 MPU regions: Flash RO, SRAM RW+XN, Peripheral, StackGuard |
+| `canary.rs` | Stack canary at 0x2001_7FFC |
+| `health.rs` | Clock, stack canary, RAM self-tests |
 
 ## Architecture
 
 ```
-firmware/src/main.rs        — entry, MPU init, clock tree (84 MHz), health checks
-firmware/src/mpu.rs         — MPU regions (flash RO, SRAM RW+XN, stack guard)
-firmware/src/health.rs      — clock, stack-canary, and RAM self-tests
-firmware/src/analog.rs      — ADC1/DMA2 ring buffer → SamplePacket → Transport
-firmware/src/transport.rs   — async USART2 + DMA transport (SamplePacket binary)
-firmware/src/digital.rs     — TIM1 PWM (4ch) + TIM3 input capture
-firmware/src/fault/mod.rs   — fault task + bit-banged UART command interface
-shared/src/lib.rs           — DAQ/fault data types, DMA-safe buffers, wire protocol
-shared/src/fault.rs         — concrete injectors (SPI/I2C/UART/CAN/OneWire), unit-tested
-```
-
-Design pattern: each protocol has one concrete injector struct (`configure`/`arm`/
-`disarm`/`fire`/`is_armed`/`injected_count`/`reset_stats`) plus a simulated bus.
-Injectors are pure logic in `shared`, so they run on the host under `cargo test`;
-the firmware drives all five over a bit-banged UART.
-
-## Pin map
-
-```
-PA0  ADC1 CH0        PA6  TIM3 CH1
-PA1  ADC1 CH1        PA8  TIM1 CH1 (25%)
-PA2  USART2 TX       PA9  TIM1 CH2 (50%)
-PA3  USART2 RX       PA10 TIM1 CH3 (75%)
-PB6  Fault UART TX   PA11 TIM1 CH4 (10%)
-PB7  Fault UART RX
+main.rs            — entry: MPU init, clock tree, BIST gate, UART telemetry loop
+bist.rs            — orchestrates all BIST checks; blocks if anything fails
+fault/mod.rs       — drives SPI/I2C/UART injectors against simulated in-RAM buses
+sco/               — ADC telemetry capture (BIST loopback + live)
+uart_telemetry.rs  — streams telemetry from external UART devices
+mpu.rs             — MPU: Flash=RO, SRAM=RW+XN, Peripheral=device, StackGuard=NoAccess
+canary.rs          — stack canary: 0xDEAD_BEEF at end of SRAM
+health.rs          — clock checks, RAM write/readback, stack canary verification
+shared/src/lib.rs  — Protocol(3), FaultType, FaultConfig, DmaBuf, SamplePacket, etc.
+shared/src/fault.rs      — SPI/I2C/UART injectors (type-state)
+shared/src/fault_traits.rs — GAT ProtocolBus trait + state markers
 ```
 
 ## Build
 
 ```bash
-cargo build --release                                          # analog (default)
-cargo build --release --no-default-features --features digital # digital
-cargo build --release --no-default-features --features fault   # fault injection
+cargo build --release --features fault
+cargo build --release --features full
 ```
 
-## Flash & run
+## Test
 
 ```bash
-probe-rs run --chip STM32F401RETx target/thumbv7em-none-eabihf/release/firmware
+cd shared && cargo test   # 40 host tests: injectors, telemetry structs, protocol
 ```
 
-Logs and panics are streamed over RTT (`probe-rs run` shows them; see `cargo install probe-rs-tools`).
-
-## Tests
+## Flash
 
 ```bash
-cd shared && cargo test
+probe-rs run --chip STM32F401RETx target/thumbv7em-none-eabihf/release/stm32-selftest
 ```

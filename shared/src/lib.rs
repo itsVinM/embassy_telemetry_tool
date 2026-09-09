@@ -3,6 +3,7 @@
 use core::mem::MaybeUninit;
 
 pub mod fault;
+pub mod fault_traits;
 
 // ─── DMA Buffer ───────────────────────────────────────────────────────────────
 
@@ -220,11 +221,9 @@ impl HealthStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Protocol {
-    Spi     = 0,
-    I2c     = 1,
-    Uart    = 2,
-    Can     = 3,
-    OneWire = 4,
+    Spi  = 0,
+    I2c  = 1,
+    Uart = 2,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -425,7 +424,8 @@ mod tests {
     #[test]
     fn protocol_repr() {
         assert_eq!(Protocol::Spi as u8, 0);
-        assert_eq!(Protocol::OneWire as u8, 4);
+        assert_eq!(Protocol::I2c as u8, 1);
+        assert_eq!(Protocol::Uart as u8, 2);
     }
 
     #[test]

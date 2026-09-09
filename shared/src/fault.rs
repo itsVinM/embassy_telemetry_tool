@@ -1,7 +1,13 @@
-//! Fault-injection library: bit primitives, LFSR probability, and one
-//! concrete injector per protocol (SPI, I2C, UART, CAN, OneWire).
-//! Pure logic, no hardware dependencies, fully unit-tested on the host.
+//! Fault-injection library: bit primitives, LFSR probability, and the three
+//! protocol injectors (SPI, I2C, UART) using a compile-time type-state
+//! (`Disarmed` -> `Armed`). CAN and OneWire removed by design.
+//!
+//! Pure logic, no hardware dependencies, unit-tested on the host.
 
+use core::marker::PhantomData;
+
+use crate::fault_traits::state::{Armed, Disarmed};
+use crate::fault_traits::{I2cBus, SpiBus, UartBus};
 use crate::{FaultConfig, FaultResult, FaultType, Protocol};
 
 // ─── Bit manipulation primitives ──────────────────────────────────────────────
@@ -25,8 +31,7 @@ pub fn bit_clear(byte: u8, bit: u8) -> u8 {
 pub fn busy_delay_us(us: u32) {
     #[cfg(target_arch = "arm")]
     {
-        let cycles = us.wrapping_mul(21);
-        for _ in 0..cycles {
+        for _ in 0..us.wrapping_mul(21) {
             unsafe { core::arch::asm!("nop") }
         }
     }
@@ -36,7 +41,7 @@ pub fn busy_delay_us(us: u32) {
     }
 }
 
-// ─── LFSR for probabilistic injection ────────────────────────────────────────
+// ─── LFSR for probabilistic injection ─────────────────────────────────────────
 
 pub struct Lfsr {
     state: u16,
@@ -66,159 +71,54 @@ pub fn should_inject(lfsr: &mut Lfsr, permille: u16) -> bool {
     if permille >= 1000 {
         return true;
     }
-    let r = lfsr.next_state() & 0x03FF;
-    r < permille
+    lfsr.next_state() & 0x03FF < permille
 }
 
-// ─── CAN ──────────────────────────────────────────────────────────────────────
+// ─── SPI ──────────────────────────────────────────────────────────────────────
 
-pub struct CanBus {
-    pub id: u32,
-    pub data: [u8; 8],
-    pub dlc: u8,
-}
-
-pub struct CanFaultInjector {
+pub struct SpiFaultInjector<S = Disarmed> {
     config: FaultConfig,
-    lfsr: Lfsr,
-    armed: bool,
-    count: u32,
+    lfsr:   Lfsr,
+    count:  u32,
+    _state: PhantomData<S>,
 }
 
-impl CanFaultInjector {
+impl SpiFaultInjector<Disarmed> {
     pub fn new() -> Self {
         Self {
-            config: FaultConfig::new(Protocol::Can, FaultType::BitFlip),
-            lfsr: Lfsr::new(0x1234),
-            armed: false,
-            count: 0,
+            config: FaultConfig::new(Protocol::Spi, FaultType::BitFlip),
+            lfsr:   Lfsr::new(0xBEEF),
+            count:  0,
+            _state: PhantomData,
         }
     }
 
     pub fn configure(&mut self, config: &FaultConfig) {
-        self.config = *config;
-    }
-
-    pub fn arm(&mut self) {
-        self.armed = true;
-        self.count = 0;
-    }
-
-    pub fn disarm(&mut self) {
-        self.armed = false;
-    }
-
-    pub fn is_armed(&self) -> bool {
-        self.armed
-    }
-
-    pub fn injected_count(&self) -> u32 {
-        self.count
-    }
-
-    pub fn reset_stats(&mut self) {
-        self.count = 0;
-    }
-
-    pub fn inject_id(&mut self, id: u32) -> u32 {
-        if !self.armed || !should_inject(&mut self.lfsr, self.config.probability_permille) {
-            return id;
+        if config.protocol == Protocol::Spi {
+            self.config = *config;
         }
-        let bit = if self.config.target_bit < 29 {
-            self.config.target_bit
-        } else {
-            self.lfsr.next_bit() % 29
-        };
-        let result = match self.config.fault_type {
-            FaultType::BitFlip => id ^ (1 << bit),
-            FaultType::StuckAtZero => id & !(1 << bit),
-            FaultType::StuckAtOne => id | (1 << bit),
-            _ => id,
-        };
-        if result != id { self.count += 1; }
-        result
     }
 
-    pub fn inject_data(&mut self, byte: u8, index: usize) -> u8 {
-        if !self.armed || !should_inject(&mut self.lfsr, self.config.probability_permille) {
-            return byte;
+    /// Compile-time state transition: `Disarmed` -> `Armed`.
+    pub fn arm(self) -> SpiFaultInjector<Armed> {
+        SpiFaultInjector {
+            config: self.config,
+            lfsr:   self.lfsr,
+            count:  0,
+            _state: PhantomData,
         }
-        let result = match self.config.fault_type {
-            FaultType::BitFlip => {
-                let bit = if self.config.target_bit < 8 { self.config.target_bit } else { self.lfsr.next_bit() };
-                bit_flip(byte, bit)
-            }
-            FaultType::CrcCorrupt if index >= 4 => {
-                bit_flip(byte, self.lfsr.next_bit())
-            }
-            FaultType::FrameCorrupt => {
-                bit_flip(byte, self.lfsr.next_bit())
-            }
-            _ => byte,
-        };
-        if result != byte { self.count += 1; }
-        result
-    }
-
-    pub fn fire(&mut self, bus: &mut CanBus) -> FaultResult {
-        if !self.armed {
-            return FaultResult::Error;
-        }
-        bus.id = self.inject_id(bus.id);
-        for (i, byte) in bus.data.iter_mut().enumerate() {
-            *byte = self.inject_data(*byte, i);
-        }
-        FaultResult::Fired
     }
 }
 
-impl Default for CanFaultInjector {
+impl Default for SpiFaultInjector<Disarmed> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-// ─── SPI ──────────────────────────────────────────────────────────────────────
-
-pub struct SpiBus {
-    pub sck: bool,
-    pub mosi: u8,
-    pub miso: u8,
-    pub cs: bool,
-}
-
-pub struct SpiFaultInjector {
-    config: FaultConfig,
-    lfsr: Lfsr,
-    armed: bool,
-    count: u32,
-}
-
-impl SpiFaultInjector {
-    pub fn new() -> Self {
-        Self {
-            config: FaultConfig::new(Protocol::Spi, FaultType::BitFlip),
-            lfsr: Lfsr::new(0xBEEF),
-            armed: false,
-            count: 0,
-        }
-    }
-
-    pub fn configure(&mut self, config: &FaultConfig) {
-        self.config = *config;
-    }
-
-    pub fn arm(&mut self) {
-        self.armed = true;
-        self.count = 0;
-    }
-
-    pub fn disarm(&mut self) {
-        self.armed = false;
-    }
-
+impl SpiFaultInjector<Armed> {
     pub fn is_armed(&self) -> bool {
-        self.armed
+        true
     }
 
     pub fn injected_count(&self) -> u32 {
@@ -229,8 +129,17 @@ impl SpiFaultInjector {
         self.count = 0;
     }
 
+    pub fn disarm(self) -> SpiFaultInjector<Disarmed> {
+        SpiFaultInjector {
+            config: self.config,
+            lfsr:   self.lfsr,
+            count:  0,
+            _state: PhantomData,
+        }
+    }
+
     pub fn inject_mosi(&mut self, byte: u8) -> u8 {
-        if !self.armed || !should_inject(&mut self.lfsr, self.config.probability_permille) {
+        if !should_inject(&mut self.lfsr, self.config.probability_permille) {
             return byte;
         }
         let bit = if self.config.target_bit < 8 {
@@ -239,19 +148,19 @@ impl SpiFaultInjector {
             self.lfsr.next_bit()
         };
         let result = match self.config.fault_type {
-            FaultType::BitFlip => bit_flip(byte, bit),
-            FaultType::StuckAtZero => bit_clear(byte, bit),
-            FaultType::StuckAtOne => bit_set(byte, bit),
-            FaultType::BitDelay => { busy_delay_us(self.config.duration_us); byte }
-            FaultType::ClockGlitch => { busy_delay_us(5); bit_flip(byte, self.lfsr.next_bit()) }
-            _ => byte,
+            FaultType::BitFlip      => bit_flip(byte, bit),
+            FaultType::StuckAtZero  => bit_clear(byte, bit),
+            FaultType::StuckAtOne   => bit_set(byte, bit),
+            FaultType::BitDelay     => { busy_delay_us(self.config.duration_us); byte }
+            FaultType::ClockGlitch  => { busy_delay_us(5); bit_flip(byte, self.lfsr.next_bit()) }
+            _                       => byte,
         };
         if result != byte { self.count += 1; }
         result
     }
 
     pub fn inject_miso(&mut self, byte: u8) -> u8 {
-        if !self.armed || !should_inject(&mut self.lfsr, self.config.probability_permille) {
+        if !should_inject(&mut self.lfsr, self.config.probability_permille) {
             return byte;
         }
         let bit = if self.config.target_bit < 8 {
@@ -260,72 +169,66 @@ impl SpiFaultInjector {
             self.lfsr.next_bit()
         };
         let result = match self.config.fault_type {
-            FaultType::BitFlip => bit_flip(byte, bit),
-            FaultType::StuckAtZero => bit_clear(byte, bit),
-            FaultType::StuckAtOne => bit_set(byte, bit),
-            _ => byte,
+            FaultType::BitFlip      => bit_flip(byte, bit),
+            FaultType::StuckAtZero  => bit_clear(byte, bit),
+            FaultType::StuckAtOne   => bit_set(byte, bit),
+            _                       => byte,
         };
         if result != byte { self.count += 1; }
         result
     }
 
     pub fn fire(&mut self, bus: &mut SpiBus) -> FaultResult {
-        if !self.armed {
-            return FaultResult::Error;
-        }
         bus.mosi = self.inject_mosi(bus.mosi);
         bus.miso = self.inject_miso(bus.miso);
         FaultResult::Fired
     }
 }
 
-impl Default for SpiFaultInjector {
+// ─── I2C ──────────────────────────────────────────────────────────────────────
+
+pub struct I2cFaultInjector<S = Disarmed> {
+    config: FaultConfig,
+    lfsr:   Lfsr,
+    count:  u32,
+    _state: PhantomData<S>,
+}
+
+impl I2cFaultInjector<Disarmed> {
+    pub fn new() -> Self {
+        Self {
+            config: FaultConfig::new(Protocol::I2c, FaultType::NackInjection),
+            lfsr:   Lfsr::new(0xCAFE),
+            count:  0,
+            _state: PhantomData,
+        }
+    }
+
+    pub fn configure(&mut self, config: &FaultConfig) {
+        if config.protocol == Protocol::I2c {
+            self.config = *config;
+        }
+    }
+
+    pub fn arm(self) -> I2cFaultInjector<Armed> {
+        I2cFaultInjector {
+            config: self.config,
+            lfsr:   self.lfsr,
+            count:  0,
+            _state: PhantomData,
+        }
+    }
+}
+
+impl Default for I2cFaultInjector<Disarmed> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-// ─── I2C ──────────────────────────────────────────────────────────────────────
-
-pub struct I2cBus {
-    pub sda: bool,
-    pub scl: bool,
-    pub address: u8,
-    pub data: u8,
-}
-
-pub struct I2cFaultInjector {
-    config: FaultConfig,
-    lfsr: Lfsr,
-    armed: bool,
-    count: u32,
-}
-
-impl I2cFaultInjector {
-    pub fn new() -> Self {
-        Self {
-            config: FaultConfig::new(Protocol::I2c, FaultType::NackInjection),
-            lfsr: Lfsr::new(0xCAFE),
-            armed: false,
-            count: 0,
-        }
-    }
-
-    pub fn configure(&mut self, config: &FaultConfig) {
-        self.config = *config;
-    }
-
-    pub fn arm(&mut self) {
-        self.armed = true;
-        self.count = 0;
-    }
-
-    pub fn disarm(&mut self) {
-        self.armed = false;
-    }
-
+impl I2cFaultInjector<Armed> {
     pub fn is_armed(&self) -> bool {
-        self.armed
+        true
     }
 
     pub fn injected_count(&self) -> u32 {
@@ -336,8 +239,17 @@ impl I2cFaultInjector {
         self.count = 0;
     }
 
+    pub fn disarm(self) -> I2cFaultInjector<Disarmed> {
+        I2cFaultInjector {
+            config: self.config,
+            lfsr:   self.lfsr,
+            count:  0,
+            _state: PhantomData,
+        }
+    }
+
     pub fn inject_address(&mut self, addr: u8) -> u8 {
-        if !self.armed || !should_inject(&mut self.lfsr, self.config.probability_permille) {
+        if !should_inject(&mut self.lfsr, self.config.probability_permille) {
             return addr;
         }
         let bit = if self.config.target_bit < 7 {
@@ -346,17 +258,17 @@ impl I2cFaultInjector {
             self.lfsr.next_bit() % 7
         };
         let result = match self.config.fault_type {
-            FaultType::BitFlip => bit_flip(addr, bit),
-            FaultType::StuckAtZero => bit_clear(addr, bit),
-            FaultType::StuckAtOne => bit_set(addr, bit),
-            _ => addr,
+            FaultType::BitFlip      => bit_flip(addr, bit),
+            FaultType::StuckAtZero  => bit_clear(addr, bit),
+            FaultType::StuckAtOne   => bit_set(addr, bit),
+            _                       => addr,
         };
         if result != addr { self.count += 1; }
         result
     }
 
     pub fn inject_data(&mut self, byte: u8) -> u8 {
-        if !self.armed || !should_inject(&mut self.lfsr, self.config.probability_permille) {
+        if !should_inject(&mut self.lfsr, self.config.probability_permille) {
             return byte;
         }
         let bit = if self.config.target_bit < 8 {
@@ -365,91 +277,79 @@ impl I2cFaultInjector {
             self.lfsr.next_bit()
         };
         let result = match self.config.fault_type {
-            FaultType::BitFlip => bit_flip(byte, bit),
-            FaultType::StuckAtZero => bit_clear(byte, bit),
-            FaultType::StuckAtOne => bit_set(byte, bit),
-            _ => byte,
+            FaultType::BitFlip      => bit_flip(byte, bit),
+            FaultType::StuckAtZero  => bit_clear(byte, bit),
+            FaultType::StuckAtOne   => bit_set(byte, bit),
+            _                       => byte,
         };
         if result != byte { self.count += 1; }
         result
     }
 
-    pub fn should_nack(&self) -> bool {
-        self.armed && self.config.fault_type == FaultType::NackInjection
-            && should_inject(&mut Lfsr::new(0), self.config.probability_permille)
+    pub fn should_nack(&mut self) -> bool {
+        self.config.fault_type == FaultType::NackInjection
+            && should_inject(&mut self.lfsr, self.config.probability_permille)
     }
 
     pub fn should_lock_bus(&self) -> bool {
-        self.armed && self.config.fault_type == FaultType::BusLockup
-    }
-
-    pub fn inject_bus_lockup(&self) {
-        if self.should_lock_bus() {
-            busy_delay_us(self.config.duration_us);
-        }
+        self.config.fault_type == FaultType::BusLockup
     }
 
     pub fn fire(&mut self, bus: &mut I2cBus) -> FaultResult {
-        if !self.armed {
-            return FaultResult::Error;
-        }
         if self.config.fault_type == FaultType::BusLockup {
-            self.inject_bus_lockup();
+            busy_delay_us(self.config.duration_us);
         }
-        if self.should_nack() {
-            self.count += 1;
-        }
+        if self.should_nack() { self.count += 1; }
         bus.address = self.inject_address(bus.address);
         bus.data = self.inject_data(bus.data);
         FaultResult::Fired
     }
 }
 
-impl Default for I2cFaultInjector {
+// ─── UART ─────────────────────────────────────────────────────────────────────
+
+pub struct UartFaultInjector<S = Disarmed> {
+    config: FaultConfig,
+    lfsr:   Lfsr,
+    count:  u32,
+    _state: PhantomData<S>,
+}
+
+impl UartFaultInjector<Disarmed> {
+    pub fn new() -> Self {
+        Self {
+            config: FaultConfig::new(Protocol::Uart, FaultType::BitFlip),
+            lfsr:   Lfsr::new(0xDEAD),
+            count:  0,
+            _state: PhantomData,
+        }
+    }
+
+    pub fn configure(&mut self, config: &FaultConfig) {
+        if config.protocol == Protocol::Uart {
+            self.config = *config;
+        }
+    }
+
+    pub fn arm(self) -> UartFaultInjector<Armed> {
+        UartFaultInjector {
+            config: self.config,
+            lfsr:   self.lfsr,
+            count:  0,
+            _state: PhantomData,
+        }
+    }
+}
+
+impl Default for UartFaultInjector<Disarmed> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-// ─── UART ─────────────────────────────────────────────────────────────────────
-
-pub struct UartBus {
-    pub tx: u8,
-    pub rx: u8,
-}
-
-pub struct UartFaultInjector {
-    config: FaultConfig,
-    lfsr: Lfsr,
-    armed: bool,
-    count: u32,
-}
-
-impl UartFaultInjector {
-    pub fn new() -> Self {
-        Self {
-            config: FaultConfig::new(Protocol::Uart, FaultType::BitFlip),
-            lfsr: Lfsr::new(0xDEAD),
-            armed: false,
-            count: 0,
-        }
-    }
-
-    pub fn configure(&mut self, config: &FaultConfig) {
-        self.config = *config;
-    }
-
-    pub fn arm(&mut self) {
-        self.armed = true;
-        self.count = 0;
-    }
-
-    pub fn disarm(&mut self) {
-        self.armed = false;
-    }
-
+impl UartFaultInjector<Armed> {
     pub fn is_armed(&self) -> bool {
-        self.armed
+        true
     }
 
     pub fn injected_count(&self) -> u32 {
@@ -460,8 +360,17 @@ impl UartFaultInjector {
         self.count = 0;
     }
 
+    pub fn disarm(self) -> UartFaultInjector<Disarmed> {
+        UartFaultInjector {
+            config: self.config,
+            lfsr:   self.lfsr,
+            count:  0,
+            _state: PhantomData,
+        }
+    }
+
     pub fn inject_tx(&mut self, byte: u8) -> u8 {
-        if !self.armed || !should_inject(&mut self.lfsr, self.config.probability_permille) {
+        if !should_inject(&mut self.lfsr, self.config.probability_permille) {
             return byte;
         }
         let bit = if self.config.target_bit < 8 {
@@ -470,19 +379,19 @@ impl UartFaultInjector {
             self.lfsr.next_bit()
         };
         let result = match self.config.fault_type {
-            FaultType::BitFlip => bit_flip(byte, bit),
-            FaultType::ParityError => byte ^ 0x80,
+            FaultType::BitFlip      => bit_flip(byte, bit),
+            FaultType::ParityError  => byte ^ 0x80,
             FaultType::FrameCorrupt => bit_flip(byte, self.lfsr.next_bit()),
-            FaultType::BitDelay => { busy_delay_us(self.config.duration_us); byte }
-            FaultType::ClockGlitch => { busy_delay_us(3); bit_flip(byte, self.lfsr.next_bit()) }
-            _ => byte,
+            FaultType::BitDelay     => { busy_delay_us(self.config.duration_us); byte }
+            FaultType::ClockGlitch  => { busy_delay_us(3); bit_flip(byte, self.lfsr.next_bit()) }
+            _                       => byte,
         };
         if result != byte { self.count += 1; }
         result
     }
 
     pub fn inject_rx(&mut self, byte: u8) -> u8 {
-        if !self.armed || !should_inject(&mut self.lfsr, self.config.probability_permille) {
+        if !should_inject(&mut self.lfsr, self.config.probability_permille) {
             return byte;
         }
         let bit = if self.config.target_bit < 8 {
@@ -491,17 +400,17 @@ impl UartFaultInjector {
             self.lfsr.next_bit()
         };
         let result = match self.config.fault_type {
-            FaultType::BitFlip => bit_flip(byte, bit),
-            FaultType::StuckAtZero => bit_clear(byte, bit),
-            FaultType::StuckAtOne => bit_set(byte, bit),
-            _ => byte,
+            FaultType::BitFlip      => bit_flip(byte, bit),
+            FaultType::StuckAtZero  => bit_clear(byte, bit),
+            FaultType::StuckAtOne   => bit_set(byte, bit),
+            _                       => byte,
         };
         if result != byte { self.count += 1; }
         result
     }
 
     pub fn inject_overrun(&mut self) -> bool {
-        if self.armed && self.config.fault_type == FaultType::Overrun
+        if self.config.fault_type == FaultType::Overrun
             && should_inject(&mut self.lfsr, self.config.probability_permille)
         {
             self.count += 1;
@@ -512,151 +421,10 @@ impl UartFaultInjector {
     }
 
     pub fn fire(&mut self, bus: &mut UartBus) -> FaultResult {
-        if !self.armed {
-            return FaultResult::Error;
-        }
         bus.tx = self.inject_tx(bus.tx);
         bus.rx = self.inject_rx(bus.rx);
         self.inject_overrun();
         FaultResult::Fired
-    }
-}
-
-impl Default for UartFaultInjector {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// ─── OneWire ──────────────────────────────────────────────────────────────────
-
-pub struct OneWireBus {
-    pub line: bool,
-    pub rom_cmd: u8,
-    pub scratchpad: [u8; 9],
-}
-
-pub struct OneWireFaultInjector {
-    config: FaultConfig,
-    lfsr: Lfsr,
-    armed: bool,
-    count: u32,
-}
-
-impl OneWireFaultInjector {
-    pub fn new() -> Self {
-        Self {
-            config: FaultConfig::new(Protocol::OneWire, FaultType::BitFlip),
-            lfsr: Lfsr::new(0x5678),
-            armed: false,
-            count: 0,
-        }
-    }
-
-    pub fn configure(&mut self, config: &FaultConfig) {
-        self.config = *config;
-    }
-
-    pub fn arm(&mut self) {
-        self.armed = true;
-        self.count = 0;
-    }
-
-    pub fn disarm(&mut self) {
-        self.armed = false;
-    }
-
-    pub fn is_armed(&self) -> bool {
-        self.armed
-    }
-
-    pub fn injected_count(&self) -> u32 {
-        self.count
-    }
-
-    pub fn reset_stats(&mut self) {
-        self.count = 0;
-    }
-
-    pub fn suppress_presence(&self) -> bool {
-        self.armed && self.config.fault_type == FaultType::Timeout
-            && should_inject(&mut Lfsr::new(0), self.config.probability_permille)
-    }
-
-    pub fn inject_data(&mut self, byte: u8, index: usize) -> u8 {
-        if !self.armed || !should_inject(&mut self.lfsr, self.config.probability_permille) {
-            return byte;
-        }
-        let bit = if self.config.target_bit < 8 {
-            self.config.target_bit
-        } else {
-            self.lfsr.next_bit()
-        };
-        let result = match self.config.fault_type {
-            FaultType::BitFlip => bit_flip(byte, bit),
-            FaultType::StuckAtZero => bit_clear(byte, bit),
-            FaultType::StuckAtOne => bit_set(byte, bit),
-            FaultType::CrcCorrupt if index >= 8 => bit_flip(byte, self.lfsr.next_bit()),
-            _ => byte,
-        };
-        if result != byte { self.count += 1; }
-        result
-    }
-
-    pub fn inject_rom_command(&mut self, cmd: u8) -> u8 {
-        if !self.armed || !should_inject(&mut self.lfsr, self.config.probability_permille) {
-            return cmd;
-        }
-        match self.config.fault_type {
-            FaultType::BitFlip => {
-                let bit = if self.config.target_bit < 8 {
-                    self.config.target_bit
-                } else {
-                    self.lfsr.next_bit()
-                };
-                let r = bit_flip(cmd, bit);
-                if r != cmd { self.count += 1; }
-                r
-            }
-            _ => cmd,
-        }
-    }
-
-    pub fn inject_timing_violation(&self) {
-        if self.armed && self.config.fault_type == FaultType::BitDelay
-            && should_inject(&mut Lfsr::new(0), self.config.probability_permille)
-        {
-            busy_delay_us(self.config.duration_us);
-        }
-    }
-
-    pub fn glitch_reset_pulse(&self) -> bool {
-        self.armed && self.config.fault_type == FaultType::ClockGlitch
-            && should_inject(&mut Lfsr::new(0), self.config.probability_permille)
-    }
-
-    pub fn fire(&mut self, bus: &mut OneWireBus) -> FaultResult {
-        if !self.armed {
-            return FaultResult::Error;
-        }
-        if self.suppress_presence() {
-            busy_delay_us(self.config.duration_us);
-        }
-        if self.glitch_reset_pulse() {
-            bus.line = false;
-        }
-        self.inject_timing_violation();
-        bus.rom_cmd = self.inject_rom_command(bus.rom_cmd);
-        for (i, byte) in bus.scratchpad.iter_mut().enumerate() {
-            *byte = self.inject_data(*byte, i);
-        }
-        FaultResult::Fired
-    }
-}
-
-impl Default for OneWireFaultInjector {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -665,6 +433,8 @@ impl Default for OneWireFaultInjector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // bit primitives
 
     #[test]
     fn bit_flip_toggles() {
@@ -690,6 +460,8 @@ mod tests {
         assert_eq!(bit_flip(0xFF, 8), 0xFE);
         assert_eq!(bit_flip(0xFF, 16), 0xFE);
     }
+
+    // lfsr
 
     #[test]
     fn lfsr_produces_values() {
@@ -725,60 +497,28 @@ mod tests {
         }
     }
 
-    #[test]
-    fn can_bit_flip_id() {
-        let cfg = FaultConfig::new(Protocol::Can, FaultType::BitFlip).at_bit(0);
-        let mut inj = CanFaultInjector::new();
-        inj.configure(&cfg);
-        inj.arm();
-        assert_eq!(inj.inject_id(0x0000_0000), 0x0000_0001);
-    }
+    // type-state API (applies to all three injectors)
 
     #[test]
-    fn can_stuck_at_zero() {
-        let cfg = FaultConfig::new(Protocol::Can, FaultType::StuckAtZero).at_bit(3);
-        let mut inj = CanFaultInjector::new();
-        inj.configure(&cfg);
-        inj.arm();
-        assert_eq!(inj.inject_id(0xFFFF_FFFF), 0xFFFF_FFF7);
+    fn spi_type_state_transitions() {
+        let inj = SpiFaultInjector::<Disarmed>::new();
+        let inj = inj.arm();
+        assert!(inj.is_armed());
+        let inj = inj.disarm();
+        let _: SpiFaultInjector<Disarmed> = inj;
+        // NOTE: a Disarmed injector has NO `fire()` method — that is the
+        // whole point. The next line would NOT compile:
+        // inj.fire(&mut SpiBus { sck: true, mosi: 0, miso: 0, cs: true });
     }
 
-    #[test]
-    fn can_crc_corrupt() {
-        let cfg = FaultConfig::new(Protocol::Can, FaultType::CrcCorrupt);
-        let mut inj = CanFaultInjector::new();
-        inj.configure(&cfg);
-        inj.arm();
-        let d0 = inj.inject_data(0xFF, 0);
-        let d4 = inj.inject_data(0xFF, 4);
-        assert_eq!(d0, 0xFF);
-        assert_ne!(d4, 0xFF);
-    }
-
-    #[test]
-    fn can_fire() {
-        let cfg = FaultConfig::new(Protocol::Can, FaultType::BitFlip).at_bit(0);
-        let mut inj = CanFaultInjector::new();
-        inj.configure(&cfg);
-        inj.arm();
-        let mut bus = CanBus { id: 0, data: [0; 8], dlc: 8 };
-        assert_eq!(inj.fire(&mut bus), FaultResult::Fired);
-        assert_eq!(bus.id, 0x0000_0001);
-    }
-
-    #[test]
-    fn can_fire_when_disarmed() {
-        let mut inj = CanFaultInjector::new();
-        let mut bus = CanBus { id: 0, data: [0; 8], dlc: 8 };
-        assert_eq!(inj.fire(&mut bus), FaultResult::Error);
-    }
+    // SPI
 
     #[test]
     fn spi_bit_flip() {
         let cfg = FaultConfig::new(Protocol::Spi, FaultType::BitFlip).at_bit(0);
         let mut inj = SpiFaultInjector::new();
         inj.configure(&cfg);
-        inj.arm();
+        let mut inj = inj.arm();
         assert_eq!(inj.inject_mosi(0b1010_0000), 0b1010_0001);
     }
 
@@ -787,7 +527,7 @@ mod tests {
         let cfg = FaultConfig::new(Protocol::Spi, FaultType::StuckAtZero).at_bit(7);
         let mut inj = SpiFaultInjector::new();
         inj.configure(&cfg);
-        inj.arm();
+        let mut inj = inj.arm();
         assert_eq!(inj.inject_mosi(0xFF), 0x7F);
     }
 
@@ -796,15 +536,8 @@ mod tests {
         let cfg = FaultConfig::new(Protocol::Spi, FaultType::StuckAtOne).at_bit(3);
         let mut inj = SpiFaultInjector::new();
         inj.configure(&cfg);
-        inj.arm();
+        let mut inj = inj.arm();
         assert_eq!(inj.inject_mosi(0x00), 0x08);
-    }
-
-    #[test]
-    fn spi_no_inject_when_disarmed() {
-        let mut inj = SpiFaultInjector::new();
-        assert_eq!(inj.inject_mosi(0xAA), 0xAA);
-        assert_eq!(inj.injected_count(), 0);
     }
 
     #[test]
@@ -812,7 +545,7 @@ mod tests {
         let cfg = FaultConfig::new(Protocol::Spi, FaultType::BitFlip).at_bit(0);
         let mut inj = SpiFaultInjector::new();
         inj.configure(&cfg);
-        inj.arm();
+        let mut inj = inj.arm();
         let mut bus = SpiBus { sck: true, mosi: 0xA5, miso: 0x5A, cs: true };
         assert_eq!(inj.fire(&mut bus), FaultResult::Fired);
         assert_eq!(bus.mosi, 0xA4);
@@ -820,11 +553,23 @@ mod tests {
     }
 
     #[test]
+    fn spi_ignores_wrong_protocol_config() {
+        // Config guarded by protocol check -> defaults apply (BitFlip at bit 0).
+        let cfg = FaultConfig::new(Protocol::Uart, FaultType::StuckAtZero).at_bit(3);
+        let mut inj = SpiFaultInjector::new();
+        inj.configure(&cfg);            // wrong protocol -> ignored
+        let mut inj = inj.arm();
+        assert_eq!(inj.inject_mosi(0x00), 0x01);  // default BitFlip@bit0, full probability
+    }
+
+    // I2C
+
+    #[test]
     fn i2c_bit_flip_address() {
         let cfg = FaultConfig::new(Protocol::I2c, FaultType::BitFlip).at_bit(0);
         let mut inj = I2cFaultInjector::new();
         inj.configure(&cfg);
-        inj.arm();
+        let mut inj = inj.arm();
         assert_eq!(inj.inject_address(0x50), 0x51);
     }
 
@@ -833,7 +578,7 @@ mod tests {
         let cfg = FaultConfig::new(Protocol::I2c, FaultType::StuckAtZero).at_bit(3);
         let mut inj = I2cFaultInjector::new();
         inj.configure(&cfg);
-        inj.arm();
+        let mut inj = inj.arm();
         assert_eq!(inj.inject_data(0xFF), 0xF7);
     }
 
@@ -842,7 +587,7 @@ mod tests {
         let cfg = FaultConfig::new(Protocol::I2c, FaultType::BusLockup);
         let mut inj = I2cFaultInjector::new();
         inj.configure(&cfg);
-        inj.arm();
+        let mut inj = inj.arm();
         assert!(inj.should_lock_bus());
     }
 
@@ -851,7 +596,7 @@ mod tests {
         let cfg = FaultConfig::new(Protocol::I2c, FaultType::BitFlip);
         let mut inj = I2cFaultInjector::new();
         inj.configure(&cfg);
-        inj.arm();
+        let mut inj = inj.arm();
         assert!(!inj.should_lock_bus());
     }
 
@@ -860,18 +605,20 @@ mod tests {
         let cfg = FaultConfig::new(Protocol::I2c, FaultType::NackInjection);
         let mut inj = I2cFaultInjector::new();
         inj.configure(&cfg);
-        inj.arm();
+        let mut inj = inj.arm();
         let mut bus = I2cBus { sda: true, scl: true, address: 0x50, data: 0xAA };
         assert_eq!(inj.fire(&mut bus), FaultResult::Fired);
         assert_eq!(inj.injected_count(), 1);
     }
+
+    // UART
 
     #[test]
     fn uart_bit_flip_tx() {
         let cfg = FaultConfig::new(Protocol::Uart, FaultType::BitFlip).at_bit(0);
         let mut inj = UartFaultInjector::new();
         inj.configure(&cfg);
-        inj.arm();
+        let mut inj = inj.arm();
         assert_eq!(inj.inject_tx(0b1010_0000), 0b1010_0001);
     }
 
@@ -880,7 +627,7 @@ mod tests {
         let cfg = FaultConfig::new(Protocol::Uart, FaultType::StuckAtZero).at_bit(4);
         let mut inj = UartFaultInjector::new();
         inj.configure(&cfg);
-        inj.arm();
+        let mut inj = inj.arm();
         assert_eq!(inj.inject_rx(0xFF), 0xEF);
     }
 
@@ -889,11 +636,11 @@ mod tests {
         let cfg = FaultConfig::new(Protocol::Uart, FaultType::Overrun);
         let mut inj = UartFaultInjector::new();
         inj.configure(&cfg);
-        inj.arm();
+        let mut inj = inj.arm();
         assert!(inj.inject_overrun());
         assert_eq!(inj.injected_count(), 1);
-        inj.disarm();
-        assert!(!inj.inject_overrun());
+        let inj = inj.disarm();
+        let _ = inj;
     }
 
     #[test]
@@ -901,59 +648,10 @@ mod tests {
         let cfg = FaultConfig::new(Protocol::Uart, FaultType::BitFlip).at_bit(0);
         let mut inj = UartFaultInjector::new();
         inj.configure(&cfg);
-        inj.arm();
+        let mut inj = inj.arm();
         let mut bus = UartBus { tx: 0xAA, rx: 0x55 };
         assert_eq!(inj.fire(&mut bus), FaultResult::Fired);
         assert_eq!(bus.tx, 0xAB);
         assert_eq!(bus.rx, 0x54);
-    }
-
-    #[test]
-    fn onewire_bit_flip() {
-        let cfg = FaultConfig::new(Protocol::OneWire, FaultType::BitFlip).at_bit(0);
-        let mut inj = OneWireFaultInjector::new();
-        inj.configure(&cfg);
-        inj.arm();
-        assert_eq!(inj.inject_data(0b1111_1110, 0), 0b1111_1111);
-    }
-
-    #[test]
-    fn onewire_crc_corrupt_after_index8() {
-        let cfg = FaultConfig::new(Protocol::OneWire, FaultType::CrcCorrupt);
-        let mut inj = OneWireFaultInjector::new();
-        inj.configure(&cfg);
-        inj.arm();
-        assert_eq!(inj.inject_data(0xFF, 0), 0xFF);
-        assert_ne!(inj.inject_data(0xFF, 10), 0xFF);
-    }
-
-    #[test]
-    fn onewire_presence_suppressed() {
-        let cfg = FaultConfig::new(Protocol::OneWire, FaultType::Timeout);
-        let mut inj = OneWireFaultInjector::new();
-        inj.configure(&cfg);
-        inj.arm();
-        assert!(inj.suppress_presence());
-    }
-
-    #[test]
-    fn onewire_rom_cmd_flip() {
-        let cfg = FaultConfig::new(Protocol::OneWire, FaultType::BitFlip).at_bit(0);
-        let mut inj = OneWireFaultInjector::new();
-        inj.configure(&cfg);
-        inj.arm();
-        assert_eq!(inj.inject_rom_command(0xCC), 0xCD);
-    }
-
-    #[test]
-    fn onewire_fire() {
-        let cfg = FaultConfig::new(Protocol::OneWire, FaultType::BitFlip).at_bit(0);
-        let mut inj = OneWireFaultInjector::new();
-        inj.configure(&cfg);
-        inj.arm();
-        let mut bus = OneWireBus { line: true, rom_cmd: 0xCC, scratchpad: [0xFF; 9] };
-        assert_eq!(inj.fire(&mut bus), FaultResult::Fired);
-        assert_eq!(bus.rom_cmd, 0xCD);
-        assert_eq!(bus.scratchpad[0], 0xFE);
     }
 }

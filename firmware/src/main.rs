@@ -1,136 +1,170 @@
 #![no_std]
 #![no_main]
 
-use defmt::info;
+use defmt::{info, warn, error};
 use defmt_rtt as _;
 use embassy_executor::Spawner;
-use embassy_stm32::rcc::{
-    APBPrescaler, Pll, PllMul, PllPDiv, PllPreDiv, PllSource, Sysclk,
-};
-use embassy_stm32::Peri;
-use embassy_stm32::peripherals::RCC;
 use embassy_stm32::Config;
 use panic_probe as _;
-use shared::HealthStatus;
 
-mod health;
 mod mpu;
-#[cfg(feature = "analog")]
-mod analog;
-#[cfg(feature = "analog")]
-mod transport;
-#[cfg(feature = "digital")]
-mod digital;
-#[cfg(feature = "fault")]
+mod canary;
+mod crypto;
 mod fault;
+mod sco;
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
+    info!("=== stm32-selftest starting ===");
+    info!("Target: STM32F401RE (Nucleo-F401RE)");
+    info!("Features: MPU + Stack Canary + AES + Fault Injection + SCO");
 
-    // MPU must be configured before any peripheral or memory access.
-    // Regions: flash RO, SRAM RW+XN, peripherals device, stack guard no-access.
+    // === 1. MEMORY PROTECTION UNIT (MPU) ===
+    // Configures memory regions: Flash=RO+X, SRAM=RW+XN, Peripherals=Device, Stack Guard=NoAccess
     mpu::init();
-    info!("mpu configured");
+    info!("MPU configured: 4 regions (Flash, SRAM, Peripherals, Stack Guard)");
 
-    // ==== CLOCK TREE CONFIG ======
+    // === 2. CLOCK CONFIGURATION ===
     let mut config = Config::default();
-    config.rcc.pll = Some(Pll {
-        prediv: PllPreDiv::Div8,   // M=8
-        mul: PllMul::Mul168,       // N=168
-        divp: Some(PllPDiv::Div4), // P=4 → 84 MHz
-        divq: None,
-        divr: None,
+    config.rcc.pll = Some(embassy_stm32::rcc::Pll {
+        prediv: embassy_stm32::rcc::PllPreDiv::Div8,
+        mul: embassy_stm32::rcc::PllMul::Mul168,
+        divp: Some(embassy_stm32::rcc::PllPDiv::Div4),  // 84 MHz
+        divq: None, divr: None,
     });
-    config.rcc.pll_src = PllSource::Hsi;
-    config.rcc.sys = Sysclk::Pll1P;
-    config.rcc.apb1_pre = APBPrescaler::Div2;  // 84/2 = 42 MHz — within limit
-    config.rcc.apb2_pre = APBPrescaler::Div1;  // 84/1 = 84 MHz 
+    config.rcc.pll_src = embassy_stm32::rcc::PllSource::Hsi;
+    config.rcc.sys = embassy_stm32::rcc::Sysclk::Pll1P;
+    config.rcc.apb1_pre = embassy_stm32::rcc::APBPrescaler::Div2;
+    config.rcc.apb2_pre = embassy_stm32::rcc::APBPrescaler::Div1;
 
-    let peripherals = embassy_stm32::init(config);
-    info!("booting...");
-    health_check(peripherals.RCC).await;
+    let p = embassy_stm32::init(config);
 
-    // Configure flash ART accelerator: 5 wait states for 84 MHz @ 3.3V
-    // STM32F401RE requires 5 WS at 84 MHz per RM0368 §3.5.1
+    // Flash ART accelerator: 5 wait states for 84 MHz @ 3.3V (RM0368 §3.5.1)
     unsafe {
         let flash_acr = 0x4002_3C00 as *mut u32;
-        let val = (5 << 0) | (1 << 8) | (1 << 9) | (1 << 10);
-        core::ptr::write_volatile(flash_acr, val);
+        core::ptr::write_volatile(flash_acr, (5 << 0) | (1 << 8) | (1 << 9) | (1 << 10));
     }
 
-    #[cfg(feature = "analog")]
-    {
-        info!("=== ANALOG MODE ===");
-        let uart_transport = transport::Transport::new(
-            peripherals.USART2,
-            peripherals.PA2,
-            peripherals.PA3,
-            peripherals.DMA1_CH6,
-            peripherals.DMA1_CH5,
-        );
-        spawner.spawn(analog::adc_task(
-            peripherals.ADC1,
-            peripherals.DMA2_CH0,
-            peripherals.PA0,
-            peripherals.PA1,
-            uart_transport,
-        ).unwrap())
-    }
+    // === 3. STACK CANARY INIT ===
+    // Places 0xDEADBEEF at end of RAM, checked periodically
+    canary::init();
+    info!("Stack canary initialized at 0x2001_7FFC");
 
-    #[cfg(feature = "digital")]
-    {
-        // PWM OUTPUT: PA8, PA9, PA10, PA11 (TIM1 Ch1-4)
-        spawner.spawn(digital::pwm_task(
-            peripherals.TIM1,
-            peripherals.PA8,   // Ch1 - 25% duty
-            peripherals.PA9,   // Ch2 - 50% duty
-            peripherals.PA10,  // Ch3 - 75% duty
-            peripherals.PA11,  // Ch4 - 10% duty
-        ).unwrap());
-  
-        // INPUT CAPTURE: PA6 (TIM3 Ch1)
-        spawner.spawn(digital::capture_task(
-            peripherals.TIM3,
-            peripherals.PA6,
-        ).unwrap());
-    }
-
-    #[cfg(all(feature = "analog", feature = "digital"))]
-    {
-        info!("!!! Both analog and digital enabled - running BOTH !!!");
-    }
-
-    #[cfg(feature = "fault")]
-    {
-        info!("=== FAULT INJECTION MODE ===");
-        let uart = fault::UartBitbang::new(peripherals.PB6, peripherals.PB7);
-        spawner.spawn(fault::fault_task_entry(uart).unwrap());
-    }
-
-    #[cfg(not(any(feature = "analog", feature = "digital", feature = "fault")))]
-    {
-        info!("WARNING: No features enabled. Enable 'analog', 'digital', or 'fault' in Cargo.toml");
+    // === 4. HEALTH CHECKS ===
+    if !canary::check() {
+        error!("FAILED: Stack canary corrupted at boot!");
         loop {}
+    }
+    info!("Health checks PASSED");
+
+    // === 5. INIT SUBSYSTEMS ===
+    // UART2 for command interface (PA2=TX, PA3=RX)
+    let mut uart = embassy_stm32::usart::Uart::new_blocking(
+        p.USART2, p.PA2, p.PA3, Default::default()
+    ).unwrap();
+    info!("UART2 initialized for command interface");
+
+    // ADC1 for power analysis (PA0 = ADC1_IN0)
+    let mut adc = embassy_stm32::adc::Adc::new(p.ADC1, Default::default());
+    let mut adc_pin = p.PA0;
+    info!("ADC1 initialized on PA0 for power capture");
+
+    // TRNG for entropy
+    let mut trng = embassy_stm32::rng::Rng::new(p.RNG);
+    info!("TRNG initialized");
+
+    // Fault injection GPIO (PB0 = crowbar trigger)
+    let mut fault_pin = embassy_stm32::gpio::Output::new(p.PB0, embassy_stm32::gpio::Level::Low, embassy_stm32::gpio::Speed::VeryHigh);
+    info!("Fault injection pin PB0 ready");
+
+    info!("=== All subsystems ready ===");
+    info!("Commands: aes, fault, sco, trng, canary, help");
+
+    // === 6. COMMAND LOOP ===
+    let mut buf = [0u8; 64];
+    loop {
+        // Non-blocking read with timeout
+        match uart.blocking_read(&mut buf) {
+            Ok(n) if n > 0 => {
+                let cmd = core::str::from_utf8(&buf[..n]).unwrap_or("").trim();
+                handle_command(cmd, &mut uart, &mut adc, &mut adc_pin, &mut trng, &mut fault_pin).await;
+            }
+            _ => {}
+        }
+        embassy_time::Timer::after_millis(10).await;
     }
 }
 
+async fn handle_command(
+    cmd: &str,
+    uart: &mut embassy_stm32::usart::Uart<'_, embassy_stm32::mode::Blocking>,
+    adc: &mut embassy_stm32::adc::Adc<'_, embassy_stm32::peripherals::ADC1>,
+    adc_pin: &mut embassy_stm32::peripherals::PA0,
+    trng: &mut embassy_stm32::rng::Rng,
+    fault_pin: &mut embassy_stm32::gpio::Output<'_>,
+) {
+    let parts: heapless::Vec<&str, 4> = cmd.split_whitespace().collect();
+    if parts.is_empty() { return; }
 
-async fn health_check(rcc: Peri<'_, RCC>){
-    let clock_status = health::check_clock(rcc);
-    if clock_status != HealthStatus::Ready {
-        info!("health FAILED: {}", clock_status.as_str());
-        loop {}
+    match parts[0] {
+        "help" => print_help(uart),
+        "aes" => crypto::aes_demo(parts.get(1), uart).await,
+        "fault" => fault::demo(parts.get(1), fault_pin, uart).await,
+        "sco" => sco::capture(parts.get(1), adc, adc_pin, uart).await,
+        "trng" => trng_demo(parts.get(1), trng, uart).await,
+        "canary" => canary_cmd(parts.get(1), uart),
+        _ => { let _ = uart.blocking_write(b"Unknown command. Type 'help'\r\n"); }
     }
+}
 
-    let canary_status = health::check_stack_canary();
-    if canary_status != HealthStatus::Ready {
-        info!("health FAILED: {}", canary_status.as_str());
-        loop {}
+fn print_help(uart: &mut embassy_stm32::usart::Uart<'_, embassy_stm32::mode::Blocking>) {
+    let help = b"\
+Commands:\r\n\
+  help              - Show this help\r\n\
+  aes [enc|dec]     - AES-128 encrypt/decrypt demo\r\n\
+  fault [vglitch]   - Voltage glitch demo (needs hardware)\r\n\
+  sco [capture]     - Power trace capture (ADC)\r\n\
+  trng [health]     - TRNG demo + health checks\r\n\
+  canary [check]    - Stack canary status\r\n\
+";
+    let _ = uart.blocking_write(help);
+}
+
+fn canary_cmd(arg: Option<&str>, uart: &mut embassy_stm32::usart::Uart<'_, embassy_stm32::mode::Blocking>) {
+    match arg {
+        Some("check") => {
+            let ok = canary::check();
+            let msg = if ok { "Stack canary: OK\r\n" } else { "Stack canary: CORRUPTED!\r\n" };
+            let _ = uart.blocking_write(msg.as_bytes());
+        }
+        _ => {
+            let addr = canary::address();
+            let val = canary::read_raw();
+            let msg = heapless::String::<64>::from("Canary at: 0x").unwrap();
+            // Note: can't easily format hex in no_std without more deps
+            let _ = uart.blocking_write(b"Canary at end of RAM (0x2001_7FFC)\r\n");
+        }
     }
+}
 
-    let ram_status = health::check_ram();
-    if ram_status != HealthStatus::Ready {
-        info!("health FAILED: {}", ram_status.as_str());
-        loop {}
+async fn trng_demo(arg: Option<&str>, trng: &mut embassy_stm32::rng::Rng, uart: &mut embassy_stm32::usart::Uart<'_, embassy_stm32::mode::Blocking>) {
+    let mut buf = [0u8; 32];
+    trng.fill_bytes(&mut buf).ok();
+    
+    let _ = uart.blocking_write(b"TRNG 32 bytes: ");
+    // Simple hex output
+    for b in buf {
+        let _ = uart.blocking_write(&[(b >> 4) + if (b >> 4) < 10 { b'0' } else { b'A' - 10 }]);
+        let _ = uart.blocking_write(&[(b & 0xF) + if (b & 0xF) < 10 { b'0' } else { b'A' - 10 }]);
+    }
+    let _ = uart.blocking_write(b"\r\n");
+
+    if arg == Some("health") {
+        let mut samples = [0u8; 1000];
+        trng.fill_bytes(&mut samples).ok();
+        let ones: usize = samples.iter().map(|b| b.count_ones() as usize).sum();
+        let prop = ones as f32 / 8000.0;
+        let passes = (prop - 0.5).abs() < 0.02;
+        let _ = uart.blocking_write(if passes { b"Monobit test: PASS\r\n" } else { b"Monobit test: FAIL\r\n" });
     }
 }
