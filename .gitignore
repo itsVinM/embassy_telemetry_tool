@@ -1,1 +1,6 @@
 /target
+firmware/target
+Cargo.lock
+firmware/Cargo.lock
+*.elf
+faultforge_out/

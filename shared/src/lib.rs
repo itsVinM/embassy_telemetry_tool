@@ -1,442 +1,415 @@
-#![cfg_attr(not(test), no_std)]
+//! faultforge-shared: wire protocol for the HIL fault-injection bench.
+//!
+//! Frame layout (both directions over the same UART):
+//!   [0x7E sync] [len] [kind] [payload (len bytes)] [crc8]
+//! crc8 covers [len, kind, payload].
+//!
+//! Guarded by a FrameParser that resyncs on garbage, so corrupted bytes are
+//! observable (the host DUT relies on this to detect injections).
 
-use core::mem::MaybeUninit;
+#![no_std]
+#![cfg_attr(not(test), forbid(unsafe_code))]
 
-pub mod fault;
-pub mod fault_traits;
+pub const SYNC: u8 = 0x7E;
 
-// ─── DMA Buffer ───────────────────────────────────────────────────────────────
+pub const MAX_PAYLOAD: usize = 16;
+pub const MAX_FRAME: usize = 3 + MAX_PAYLOAD + 1; // sync + len + kind + payload + crc
 
-#[repr(C, align(4))]
-pub struct DmaBuf<T, const N: usize> {
-    buf: [MaybeUninit<T>; N],
+// Frame kinds. Host -> injector and injector -> host share one address space.
+pub const K_START: u8 = 0x01; // host -> fw: begin a campaign
+pub const K_PING: u8 = 0x02; // host -> fw: link handshake
+pub const K_ABORT: u8 = 0x03; // host -> fw: stop current campaign
+pub const K_GLITCH: u8 = 0x04; // host -> fw: fire one physical duty glitch
+
+pub const K_SENSOR: u8 = 0x80; // fw -> host: a "measurement" frame (may be faulted)
+pub const K_FAULT: u8 = 0x81; // fw -> host: ground-truth injection notice
+pub const K_END: u8 = 0x82; // fw -> host: campaign complete
+pub const K_PONG: u8 = 0x83; // fw -> host: handshake reply
+
+// Fault kinds carried inside FAULT_EVENT payloads and the campaign weight vector.
+pub const FAULT_NONE: u8 = 0;
+pub const FAULT_BITFLIP: u8 = 1;
+pub const FAULT_BYTE: u8 = 2;
+pub const FAULT_DROP: u8 = 3;
+pub const FAULT_DELAY: u8 = 4;
+pub const FAULT_REPLAY: u8 = 5;
+pub const FAULT_BURST: u8 = 6;
+pub const FAULT_DUTY: u8 = 7;
+pub const N_FAULT_KINDS: usize = 7;
+
+pub const START_PAYLOAD_LEN: usize = 15; // seed4 + packets2 + cadence_ms2 + weights7
+pub const SENSOR_PAYLOAD_LEN: usize = 10; // seq2 + value4 + fault_id4
+pub const FAULT_PAYLOAD_LEN: usize = 7; // fault_id4 + kind1 + at_seq2
+pub const END_PAYLOAD_LEN: usize = 6; // packets2 + faults4
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CampaignConfig {
+    pub seed: u32,
+    pub packets: u16,
+    pub cadence_ms: u16,
+    pub weights: [u8; N_FAULT_KINDS],
 }
 
-impl<T, const N: usize> DmaBuf<T, N> {
-    pub const fn new() -> Self
-    where
-        T: Copy,
-    {
-        Self { buf: [MaybeUninit::uninit(); N] }
-    }
-
-    pub const fn len(&self) -> usize {
-        N
-    }
-
-    pub const fn is_empty(&self) -> bool {
-        N == 0
-    }
-
-    pub fn as_mut_ptr(&mut self) -> *mut T {
-        self.buf.as_mut_ptr() as *mut T
-    }
-
-    /// Exposes the backing storage as a mutable slice for DMA.
-    ///
-    /// # Safety
-    ///
-    /// Must not be aliased while a DMA transfer is writing to the buffer.
-    pub unsafe fn as_mut_slice(&mut self) -> &mut [T] {
-        core::slice::from_raw_parts_mut(self.buf.as_mut_ptr() as *mut T, N)
+impl CampaignConfig {
+    pub fn clean(seed: u32, packets: u16, cadence_ms: u16) -> Self {
+        Self { seed, packets, cadence_ms, weights: [0; N_FAULT_KINDS] }
     }
 }
 
-impl<T: Copy, const N: usize> Default for DmaBuf<T, N> {
-    fn default() -> Self {
-        Self::new()
+/// Deterministic PRNG shared by the firmware injector and the host simulator so
+/// a campaign is reproducible from its seed.
+#[derive(Clone, Copy, Debug)]
+pub struct Lcg(pub u32);
+
+impl Lcg {
+    pub fn new(seed: u32) -> Self {
+        // Mix the seed so adjacent seeds diverge immediately.
+        Self(seed.wrapping_mul(1664525).wrapping_add(1013904223))
+    }
+
+    pub fn next_u32(&mut self) -> u32 {
+        self.0 = self.0.wrapping_mul(1103515245).wrapping_add(12345);
+        self.0
+    }
+
+    pub fn next_u8(&mut self) -> u8 {
+        (self.next_u32() >> 24) as u8
+    }
+
+    /// Uniform value in [0, n).
+    pub fn below(&mut self, n: u32) -> u32 {
+        if n == 0 {
+            0
+        } else {
+            self.next_u32() % n
+        }
     }
 }
 
-// ─── DAQ Data Structures ──────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum ChannelId {
-    Analog0 = 0,
-    Analog1 = 1,
-    PwmIn   = 2,
+/// CRC-8/ATM (poly 0x07), MSB-first. Initial value 0.
+pub fn crc8(data: &[u8]) -> u8 {
+    let mut c: u8 = 0;
+    for &b in data {
+        c ^= b;
+        for _ in 0..8 {
+            c = if c & 0x80 != 0 { (c << 1) ^ 0x07 } else { c << 1 };
+        }
+    }
+    c
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-#[repr(C)]
-pub struct Sample {
-    pub channel: ChannelId,
-    pub timestamp_us: u32,
-    pub value: u32,
-    pub flags: u8,
+pub fn crc8_frame(len: u8, kind: u8, payload: &[u8]) -> u8 {
+    let mut short = [0u8; 1 + 1 + MAX_PAYLOAD];
+    short[0] = len;
+    short[1] = kind;
+    short[2..2 + payload.len()].copy_from_slice(payload);
+    crc8(&short[..2 + payload.len()])
 }
 
-pub const SAMPLES_PER_PACKET: usize = 32;
-
-#[repr(C)]
-pub struct SamplePacket {
-    pub magic: u16,
-    pub seq: u16,
-    pub count: u16,
-    pub samples: [Sample; SAMPLES_PER_PACKET],
+/// Encode a frame into a fixed buffer. Returns (buffer, total length incl. crc).
+pub fn encode(kind: u8, payload: &[u8]) -> ([u8; MAX_FRAME], usize) {
+    let mut buf = [0u8; MAX_FRAME];
+    buf[0] = SYNC;
+    buf[1] = payload.len() as u8;
+    buf[2] = kind;
+    buf[3..3 + payload.len()].copy_from_slice(payload);
+    let data_end = 3 + payload.len();
+    buf[data_end] = crc8(&buf[1..data_end]);
+    (buf, data_end + 1)
 }
 
-impl SamplePacket {
-    pub const MAGIC: u16 = 0xDA71;
+pub fn put_u16(d: &mut [u8], o: usize, v: u16) {
+    d[o] = v as u8;
+    d[o + 1] = (v >> 8) as u8;
+}
 
+pub fn get_u16(d: &[u8], o: usize) -> u16 {
+    d[o] as u16 | ((d[o + 1] as u16) << 8)
+}
+
+pub fn put_u32(d: &mut [u8], o: usize, v: u32) {
+    d[o] = v as u8;
+    d[o + 1] = (v >> 8) as u8;
+    d[o + 2] = (v >> 16) as u8;
+    d[o + 3] = (v >> 24) as u8;
+}
+
+pub fn get_u32(d: &[u8], o: usize) -> u32 {
+    d[o] as u32
+        | ((d[o + 1] as u32) << 8)
+        | ((d[o + 2] as u32) << 16)
+        | ((d[o + 3] as u32) << 24)
+}
+
+// ---- host -> injector ----
+
+pub fn encode_start(cfg: &CampaignConfig) -> ([u8; MAX_FRAME], usize) {
+    let mut p = [0u8; START_PAYLOAD_LEN];
+    put_u32(&mut p, 0, cfg.seed);
+    put_u16(&mut p, 4, cfg.packets);
+    put_u16(&mut p, 6, cfg.cadence_ms);
+    p[8..8 + N_FAULT_KINDS].copy_from_slice(&cfg.weights);
+    encode(K_START, &p)
+}
+
+pub fn encode_ping() -> ([u8; MAX_FRAME], usize) {
+    encode(K_PING, &[])
+}
+
+pub fn encode_abort() -> ([u8; MAX_FRAME], usize) {
+    encode(K_ABORT, &[])
+}
+
+pub fn decode_start(p: &[u8]) -> Option<CampaignConfig> {
+    if p.len() < START_PAYLOAD_LEN {
+        return None;
+    }
+    let mut weights = [0u8; N_FAULT_KINDS];
+    weights.copy_from_slice(&p[8..8 + N_FAULT_KINDS]);
+    Some(CampaignConfig {
+        seed: get_u32(p, 0),
+        packets: get_u16(p, 4),
+        cadence_ms: get_u16(p, 6),
+        weights,
+    })
+}
+
+// ---- injector -> host ----
+
+pub fn encode_sensor(seq: u16, value: u32, fault_id: u32) -> ([u8; MAX_FRAME], usize) {
+    let mut p = [0u8; SENSOR_PAYLOAD_LEN];
+    put_u16(&mut p, 0, seq);
+    put_u32(&mut p, 2, value);
+    put_u32(&mut p, 6, fault_id);
+    encode(K_SENSOR, &p)
+}
+
+pub fn encode_fault_event(fault_id: u32, kind: u8, at_seq: u16) -> ([u8; MAX_FRAME], usize) {
+    let mut p = [0u8; FAULT_PAYLOAD_LEN];
+    put_u32(&mut p, 0, fault_id);
+    p[4] = kind;
+    put_u16(&mut p, 5, at_seq);
+    encode(K_FAULT, &p)
+}
+
+pub fn encode_end(packets: u16, faults: u32) -> ([u8; MAX_FRAME], usize) {
+    let mut p = [0u8; END_PAYLOAD_LEN];
+    put_u16(&mut p, 0, packets);
+    put_u32(&mut p, 2, faults);
+    encode(K_END, &p)
+}
+
+pub fn encode_pong() -> ([u8; MAX_FRAME], usize) {
+    encode(K_PONG, &[])
+}
+
+// ---- streaming parser ----
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Decoded {
+    /// A frame passed and its CRC verified.
+    Frame { kind: u8, payload: [u8; MAX_PAYLOAD], len: usize },
+    /// Enough bytes for a frame arrived but the CRC did not match. The junk is
+    /// consumed; this is the observable signature of a corrupted frame.
+    BadCrc { kind: u8 },
+    /// A run of bytes that were skipped while resynchronising.
+    Garbage,
+}
+
+pub struct FrameParser {
+    buf: [u8; MAX_FRAME],
+    len: usize,
+}
+
+impl FrameParser {
     pub const fn new() -> Self {
-        Self {
-            magic: Self::MAGIC,
-            seq: 0,
-            count: 0,
-            samples: [Sample {
-                channel: ChannelId::Analog0,
-                timestamp_us: 0,
-                value: 0,
-                flags: 0,
-            }; SAMPLES_PER_PACKET],
+        Self { buf: [0; MAX_FRAME], len: 0 }
+    }
+
+    /// Feed one byte; returns at most one outcome per call.
+    pub fn push(&mut self, b: u8) -> Option<Decoded> {
+        if self.len < self.buf.len() {
+            self.buf[self.len] = b;
+            self.len += 1;
         }
+        self.extract()
     }
 
-    pub fn push(&mut self, channel: ChannelId, timestamp_us: u32, value: u32) {
-        let idx = self.count as usize;
-        if idx < SAMPLES_PER_PACKET {
-            self.samples[idx] = Sample { channel, timestamp_us, value, flags: 0 };
-            self.count += 1;
-        }
-    }
+    fn extract(&mut self) -> Option<Decoded> {
+        loop {
+            // Find the first sync byte.
+            match self.buf[..self.len].iter().position(|&x| x == SYNC) {
+                None => {
+                    if self.len > 0 {
+                        self.len = 0;
+                        return Some(Decoded::Garbage);
+                    }
+                    return None;
+                }
+                Some(0) => {}
+                Some(i) => {
+                    self.buf.copy_within(i..self.len, 0);
+                    self.len -= i;
+                    // Bytes before the sync are junk.
+                    if i > 0 {
+                        return Some(Decoded::Garbage);
+                    }
+                }
+            }
 
-    pub fn is_full(&self) -> bool {
-        self.count as usize >= SAMPLES_PER_PACKET
-    }
+            if self.len < 2 {
+                return None; // need len byte
+            }
+            let plen = self.buf[1] as usize;
+            // Guard against absurd lengths (also resyncs on corrupted len bytes).
+            if plen > MAX_PAYLOAD {
+                self.len = 0;
+                return Some(Decoded::Garbage);
+            }
+            let need = 3 + plen;
+            if self.len < need {
+                return None; // need more bytes
+            }
 
-    pub fn finalize(&mut self, seq: u16) {
-        self.magic = Self::MAGIC;
-        self.seq = seq;
-    }
+            let kind = self.buf[2];
+            let mut full = [0u8; MAX_PAYLOAD];
+            full[..plen].copy_from_slice(&self.buf[3..3 + plen]);
+            let expected = crc8(&self.buf[1..3 + plen]);
+            let got = self.buf[need - 1];
 
-    pub fn as_bytes(&self) -> &[u8] {
-        let len = core::mem::size_of_val(self);
-        unsafe { core::slice::from_raw_parts(self as *const _ as *const u8, len) }
-    }
-}
+            // Consume exactly the frame.
+            self.buf.copy_within(need..self.len, 0);
+            self.len -= need;
 
-impl Default for SamplePacket {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// ─── Calibration ──────────────────────────────────────────────────────────────
-
-#[repr(C)]
-pub struct AdcCalibration {
-    pub vref_mv: u16,
-    pub offset_ch0: i16,
-    pub offset_ch1: i16,
-    pub gain_ch0: u16,
-    pub gain_ch1: u16,
-}
-
-impl AdcCalibration {
-    pub const fn default() -> Self {
-        Self { vref_mv: 3300, offset_ch0: 0, offset_ch1: 0, gain_ch0: 4095, gain_ch1: 4095 }
-    }
-
-    pub fn counts_to_mv(&self, counts: u32, channel: ChannelId) -> u32 {
-        let (offset, gain) = match channel {
-            ChannelId::Analog0 => (self.offset_ch0 as i32, self.gain_ch0 as u32),
-            ChannelId::Analog1 => (self.offset_ch1 as i32, self.gain_ch1 as u32),
-            _ => return 0,
-        };
-        let adjusted = (counts as i32).saturating_add(-offset).max(0) as u32;
-        (adjusted * self.vref_mv as u32) / gain
-    }
-}
-
-// ─── Protocol Commands ────────────────────────────────────────────────────────
-
-#[repr(u8)]
-pub enum Command {
-    StartStream  = 0x01,
-    StopStream   = 0x02,
-    SetRate      = 0x03,
-    Calibrate    = 0x04,
-    Ping         = 0x05,
-    QueryConfig  = 0x06,
-}
-
-#[repr(u8)]
-pub enum Response {
-    Ack       = 0x81,
-    Nak       = 0x82,
-    Data      = 0x83,
-    Config    = 0x84,
-    Pong      = 0x85,
-}
-
-// ─── Acquisition Config ───────────────────────────────────────────────────────
-
-#[repr(C)]
-pub struct AcquisitionConfig {
-    pub sample_rate_hz: u32,
-    pub channels_active: u8,
-    pub dma_depth: u16,
-}
-
-impl AcquisitionConfig {
-    pub const fn default() -> Self {
-        Self { sample_rate_hz: 10_000, channels_active: 0x03, dma_depth: 4096 }
-    }
-}
-
-// ─── Health Status ────────────────────────────────────────────────────────────
-
-#[derive(Debug, PartialEq)]
-pub enum HealthStatus {
-    Ready,
-    Fail(HealthError),
-}
-
-#[derive(Debug, PartialEq)]
-pub enum HealthError {
-    StackCanary,
-    RamTest,
-    TimerNotTicking,
-    ClockOutOfRange,
-    ClockHclkNotRunning,
-}
-
-impl HealthStatus {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            HealthStatus::Ready => "READY\n",
-            HealthStatus::Fail(HealthError::StackCanary) => "FAIL:stack\n",
-            HealthStatus::Fail(HealthError::RamTest) => "FAIL:ram\n",
-            HealthStatus::Fail(HealthError::TimerNotTicking) => "FAIL:tim\n",
-            HealthStatus::Fail(HealthError::ClockOutOfRange) => "FAIL:clk\n",
-            HealthStatus::Fail(HealthError::ClockHclkNotRunning) => "FAIL:hclk\n",
+            if got != expected {
+                return Some(Decoded::BadCrc { kind });
+            }
+            return Some(Decoded::Frame { kind, payload: full, len: plen });
         }
     }
 }
-
-// ─── Fault Injection ─────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum Protocol {
-    Spi  = 0,
-    I2c  = 1,
-    Uart = 2,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum FaultType {
-    BitFlip       = 0x01,
-    StuckAtZero   = 0x02,
-    StuckAtOne    = 0x03,
-    BitDelay      = 0x04,
-    ClockGlitch   = 0x05,
-    FrameCorrupt  = 0x06,
-    NackInjection = 0x07,
-    ParityError   = 0x08,
-    CrcCorrupt    = 0x09,
-    BusLockup     = 0x0A,
-    Overrun       = 0x0B,
-    Timeout       = 0x0C,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum FaultCommand {
-    Arm    = 0x01,
-    Disarm = 0x02,
-    Fire   = 0x03,
-    Status = 0x04,
-    Reset  = 0x05,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum FaultResult {
-    Armed     = 0x01,
-    Disarmed  = 0x02,
-    Fired     = 0x03,
-    Busy      = 0x04,
-    Error     = 0x05,
-    Completed = 0x06,
-}
-
-#[derive(Debug, Clone, Copy)]
-#[repr(C)]
-pub struct FaultConfig {
-    pub protocol: Protocol,
-    pub fault_type: FaultType,
-    pub target_bit: u8,
-    pub duration_us: u32,
-    pub repeat_count: u8,
-    pub probability_permille: u16,
-}
-
-impl FaultConfig {
-    pub const fn new(protocol: Protocol, fault_type: FaultType) -> Self {
-        Self {
-            protocol,
-            fault_type,
-            target_bit: 0,
-            duration_us: 0,
-            repeat_count: 1,
-            probability_permille: 1000,
-        }
-    }
-
-    pub const fn at_bit(mut self, bit: u8) -> Self {
-        self.target_bit = bit;
-        self
-    }
-
-    pub const fn for_us(mut self, us: u32) -> Self {
-        self.duration_us = us;
-        self
-    }
-
-    pub const fn repeat(mut self, n: u8) -> Self {
-        self.repeat_count = n;
-        self
-    }
-
-    pub const fn probability(mut self, permille: u16) -> Self {
-        self.probability_permille = permille;
-        self
-    }
-}
-
-// ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn ready_status_returns_correct_string() {
-        assert_eq!(HealthStatus::Ready.as_str(), "READY\n");
+    fn crc8_known_vector() {
+        // CRC-8/ATM("123456789") == 0xF4
+        assert_eq!(crc8(b"123456789"), 0xF4);
     }
 
     #[test]
-    fn fail_clock_returns_correct_string() {
-        let status = HealthStatus::Fail(HealthError::ClockOutOfRange);
-        assert_eq!(status.as_str(), "FAIL:clk\n");
-    }
+    fn encode_decode_sensor_roundtrip() {
+        let (buf, n) = encode_sensor(0x12AB, 0xDEAD_BEEF, 7);
+        assert_eq!(n, 3 + SENSOR_PAYLOAD_LEN + 1);
+        assert_eq!(buf[0], SYNC);
 
-    #[test]
-    fn sample_packet_basic_roundtrip() {
-        let mut pkt = SamplePacket::new();
-        assert!(!pkt.is_full());
-        assert_eq!(pkt.count, 0);
-
-        pkt.push(ChannelId::Analog0, 100, 2048);
-        pkt.push(ChannelId::Analog1, 200, 1024);
-        assert_eq!(pkt.count, 2);
-
-        pkt.finalize(1);
-        assert_eq!(pkt.magic, SamplePacket::MAGIC);
-        assert_eq!(pkt.seq, 1);
-    }
-
-    #[test]
-    fn sample_packet_fills_up() {
-        let mut pkt = SamplePacket::new();
-        for i in 0..SAMPLES_PER_PACKET {
-            assert!(!pkt.is_full());
-            pkt.push(ChannelId::Analog0, i as u32 * 100, i as u32);
+        let mut p = FrameParser::new();
+        let mut frames = core::vec::Vec::new();
+        for &b in &buf[..n] {
+            if let Some(d) = p.push(b) {
+                frames.push(d);
+            }
         }
-        assert!(pkt.is_full());
-        assert_eq!(pkt.count as usize, SAMPLES_PER_PACKET);
-    }
-
-    #[test]
-    fn sample_packet_does_not_overflow() {
-        let mut pkt = SamplePacket::new();
-        for _ in 0..SAMPLES_PER_PACKET + 10 {
-            pkt.push(ChannelId::Analog0, 0, 0);
+        assert_eq!(frames.len(), 1);
+        match frames[0] {
+            Decoded::Frame { kind, payload, len } => {
+                assert_eq!(kind, K_SENSOR);
+                assert_eq!(len, SENSOR_PAYLOAD_LEN);
+                assert_eq!(get_u16(&payload, 0), 0x12AB);
+                assert_eq!(get_u32(&payload, 2), 0xDEAD_BEEF);
+                assert_eq!(get_u32(&payload, 6), 7);
+            }
+            _ => panic!("expected frame"),
         }
-        assert_eq!(pkt.count as usize, SAMPLES_PER_PACKET);
     }
 
     #[test]
-    fn calibration_counts_to_mv() {
-        let cal = AdcCalibration::default();
-        let mv = cal.counts_to_mv(2048, ChannelId::Analog0);
-        assert_eq!(mv, 1650);
+    fn parser_resyncs_through_garbage() {
+        let mut p = FrameParser::new();
+        let mut out = core::vec::Vec::new();
+        // garbage burst, then a clean sensor frame
+        let garbage = [0xA5u8, 0x00, 0xFF, 0x7E, 0x63, 0x7E]; // includes plenty of nonsense
+        let (frame, n) = encode_sensor(1, 10, 0);
+        for &b in garbage.iter().chain(&frame[..n]) {
+            if let Some(d) = p.push(b) {
+                out.push(d);
+            }
+        }
+        let has_frame = out.iter().any(|d| matches!(d, Decoded::Frame { kind: K_SENSOR, .. }));
+        assert!(has_frame, "parser should find the frame after garbage: {out:?}");
     }
 
     #[test]
-    fn calibration_with_offset() {
-        let cal = AdcCalibration {
-            vref_mv: 3300,
-            offset_ch0: 100,
-            offset_ch1: 0,
-            gain_ch0: 4095,
-            gain_ch1: 4095,
+    fn parser_reports_bad_crc() {
+        let mut p = FrameParser::new();
+        let mut out = core::vec::Vec::new();
+        let (mut frame, n) = encode_sensor(5, 3, 0);
+        frame[n - 1] ^= 0xFF; // corrupt the stored crc
+        for &b in &frame[..n] {
+            if let Some(d) = p.push(b) {
+                out.push(d);
+            }
+        }
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0], Decoded::BadCrc { .. }), "got {out:?}");
+    }
+
+    #[test]
+    fn start_config_roundtrip() {
+        let cfg = CampaignConfig {
+            seed: 0xCAFE_1234,
+            packets: 1500,
+            cadence_ms: 5,
+            weights: [0, 20, 0, 30, 10, 5, 2],
         };
-        let mv = cal.counts_to_mv(100, ChannelId::Analog0);
-        assert_eq!(mv, 0);
+        let (buf, n) = encode_start(&cfg);
+        let mut p = FrameParser::new();
+        let mut decoded = None;
+        for &b in &buf[..n] {
+            if let Some(Decoded::Frame { payload, len, .. }) = p.push(b) {
+                decoded = Some((payload, len));
+            }
+        }
+        let (payload, len) = decoded.expect("start frame");
+        let got = decode_start(&payload[..len]).expect("decode start");
+        assert_eq!(got.seed, cfg.seed);
+        assert_eq!(got.packets, cfg.packets);
+        assert_eq!(got.cadence_ms, cfg.cadence_ms);
+        assert_eq!(got.weights, cfg.weights);
     }
 
     #[test]
-    fn health_error_new_variant() {
-        let err = HealthStatus::Fail(HealthError::ClockHclkNotRunning);
-        assert_eq!(err.as_str(), "FAIL:hclk\n");
-    }
-
-    // ── Fault injection tests ───────────────────────────────────────────
-
-    #[test]
-    fn fault_config_new() {
-        let cfg = FaultConfig::new(Protocol::Spi, FaultType::BitFlip);
-        assert_eq!(cfg.protocol, Protocol::Spi);
-        assert_eq!(cfg.fault_type, FaultType::BitFlip);
-        assert_eq!(cfg.target_bit, 0);
-        assert_eq!(cfg.duration_us, 0);
-        assert_eq!(cfg.repeat_count, 1);
-        assert_eq!(cfg.probability_permille, 1000);
+    fn lcg_deterministic_and_distributed() {
+        let mut a = Lcg::new(42);
+        let mut b = Lcg::new(42);
+        for _ in 0..1000 {
+            assert_eq!(a.next_u32(), b.next_u32());
+            let v = a.below(100);
+            assert!(v < 100);
+        }
     }
 
     #[test]
-    fn fault_config_builder() {
-        let cfg = FaultConfig::new(Protocol::I2c, FaultType::NackInjection)
-            .at_bit(3)
-            .for_us(100)
-            .repeat(5)
-            .probability(500);
-        assert_eq!(cfg.protocol, Protocol::I2c);
-        assert_eq!(cfg.fault_type, FaultType::NackInjection);
-        assert_eq!(cfg.target_bit, 3);
-        assert_eq!(cfg.duration_us, 100);
-        assert_eq!(cfg.repeat_count, 5);
-        assert_eq!(cfg.probability_permille, 500);
-    }
-
-    #[test]
-    fn fault_type_repr() {
-        assert_eq!(FaultType::BitFlip as u8, 0x01);
-        assert_eq!(FaultType::CrcCorrupt as u8, 0x09);
-        assert_eq!(FaultType::Timeout as u8, 0x0C);
-    }
-
-    #[test]
-    fn protocol_repr() {
-        assert_eq!(Protocol::Spi as u8, 0);
-        assert_eq!(Protocol::I2c as u8, 1);
-        assert_eq!(Protocol::Uart as u8, 2);
-    }
-
-    #[test]
-    fn fault_command_repr() {
-        assert_eq!(FaultCommand::Arm as u8, 0x01);
-        assert_eq!(FaultCommand::Reset as u8, 0x05);
-    }
-
-    #[test]
-    fn fault_result_repr() {
-        assert_eq!(FaultResult::Armed as u8, 0x01);
-        assert_eq!(FaultResult::Completed as u8, 0x06);
+    fn frame_with_sync_in_payload_parses() {
+        // payload contains a 0x7E byte inside a valid frame and a second frame follows
+        let mut p = FrameParser::new();
+        let mut out = core::vec::Vec::new();
+        let (f1, n1) = encode(K_SENSOR, &[SYNC, 1, 2, 3]);
+        let (f2, n2) = encode(K_SENSOR, &[4, 5, 6, 7]);
+        for &b in f1[..n1].iter().chain(&f2[..n2]) {
+            if let Some(d) = p.push(b) {
+                out.push(d);
+            }
+        }
+        let frames: Vec<_> = out
+            .iter()
+            .filter_map(|d| match d {
+                Decoded::Frame { payload, len, .. } => Some(payload[..*len].to_vec()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(frames, vec![vec![SYNC, 1, 2, 3], vec![4, 5, 6, 7]]);
     }
 }

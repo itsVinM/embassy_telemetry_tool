@@ -1,0 +1,20 @@
+[package]
+name = "faultforge-host"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "faultforge"
+path = "src/main.rs"
+
+[dependencies]
+faultforge-shared = { path = "../shared" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "io-util", "signal"] }
+serialport = "4"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "macros", "rt-multi-thread", "time", "sync", "io-util", "signal"] }
+
+[profile.release]
+lto = true
+debug = 1

@@ -1,6 +1,7 @@
 [workspace]
 members = [
-    "firmware",
     "shared",
+    "host",
 ]
+default-members = ["shared", "host"]
 resolver = "2"
